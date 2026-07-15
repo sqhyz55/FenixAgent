@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import { parseWorkflowYaml } from "../../parser/yaml-parser";
+import { CustomNodeRegistry } from "../../plugins/registry";
+import type { CustomNode } from "../../plugins/types";
 import { WorkflowError, WorkflowErrorCode } from "../../types/errors";
 
 const VALID_YAML = `\
@@ -350,4 +352,332 @@ nodes:
     prompt: "hello"
 `;
   expect(() => parseWorkflowYaml(yaml)).toThrow(/agent node requires 'agent'/);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Custom 节点解析测试
+// ═══════════════════════════════════════════════════════════════
+
+/** 创建带假工具的 CustomNodeRegistry，用于测试 */
+function createFakeRegistry(
+  tools: Array<{ name: string; produces: string[]; kind?: "default" | "slurm" }>,
+): CustomNodeRegistry {
+  const registry = new CustomNodeRegistry();
+  for (const t of tools) {
+    registry.register({
+      name: t.name,
+      description: `Fake ${t.name}`,
+      inputs: {},
+      produces: t.produces,
+      kind: t.kind,
+      execute: async () => ({ stdout: "ok", exit_code: 0 }),
+    } as CustomNode);
+  }
+  return registry;
+}
+
+test("解析 custom 节点", () => {
+  const registry = createFakeRegistry([{ name: "trim_galore", produces: ["trimmed_r1", "trimmed_r2"] }]);
+  const def = parseWorkflowYaml(
+    `\
+schema_version: '1'
+name: test
+nodes:
+  - id: trim
+    type: custom
+    tool: trim_galore
+    outputs:
+      trimmed_r1:
+        pattern: "/tmp/\${{ foreach.item.id }}_1.fq.gz"
+        type: file
+      trimmed_r2:
+        pattern: "/tmp/\${{ foreach.item.id }}_2.fq.gz"
+        type: file
+`,
+    undefined,
+    { customRegistry: registry },
+  );
+  expect(def.nodes[0].type).toBe("custom");
+  if (def.nodes[0].type === "custom") {
+    expect(def.nodes[0].tool).toBe("trim_galore");
+  }
+});
+
+test("custom 节点缺少 tool 字段报错", () => {
+  try {
+    parseWorkflowYaml(`\
+schema_version: '1'
+name: test
+nodes:
+  - id: bad
+    type: custom
+    outputs:
+      x:
+        pattern: /tmp/x.txt
+        type: file
+`);
+    expect(true).toBe(false);
+  } catch (e) {
+    expect((e as Error).message).toContain("tool");
+  }
+});
+
+test("custom 节点 tool 未注册时报错", () => {
+  const registry = createFakeRegistry([]);
+  try {
+    parseWorkflowYaml(
+      `\
+schema_version: '1'
+name: test
+nodes:
+  - id: bad
+    type: custom
+    tool: nonexistent
+    outputs:
+      x:
+        pattern: /tmp/x.txt
+        type: file
+`,
+      undefined,
+      { customRegistry: registry },
+    );
+    expect(true).toBe(false);
+  } catch (e) {
+    expect((e as Error).message).toContain("not registered");
+  }
+});
+
+test("custom 节点缺少 outputs 报错", () => {
+  const registry = createFakeRegistry([{ name: "trim_galore", produces: ["out"] }]);
+  try {
+    parseWorkflowYaml(
+      `\
+schema_version: '1'
+name: test
+nodes:
+  - id: bad
+    type: custom
+    tool: trim_galore
+`,
+      undefined,
+      { customRegistry: registry },
+    );
+    expect(true).toBe(false);
+  } catch (e) {
+    expect((e as Error).message).toContain("outputs");
+  }
+});
+
+test("custom 节点解析可选字段", () => {
+  const registry = createFakeRegistry([{ name: "my_tool", produces: ["out"] }]);
+  const def = parseWorkflowYaml(
+    `\
+schema_version: '1'
+name: test
+nodes:
+  - id: c1
+    type: custom
+    tool: my_tool
+    foreach: "\${{ params.samples }}"
+    maxConcurrent: 3
+    continueOnError: true
+    inputs:
+      r1: "\${{ foreach.item.r1 }}"
+    outputs:
+      out:
+        pattern: /tmp/out.txt
+        type: file
+`,
+    undefined,
+    { customRegistry: registry },
+  );
+  expect(def.nodes[0].type).toBe("custom");
+  if (def.nodes[0].type === "custom") {
+    expect(def.nodes[0].foreach).toBe("${{ params.samples }}");
+    expect(def.nodes[0].maxConcurrent).toBe(3);
+    expect(def.nodes[0].continueOnError).toBe(true);
+    expect(def.nodes[0].inputs).toEqual({ r1: "${{ foreach.item.r1 }}" });
+  }
+});
+
+test("无 registry 时 custom 节点跳过 tool 校验", () => {
+  const def = parseWorkflowYaml(`\
+schema_version: '1'
+name: test
+nodes:
+  - id: c1
+    type: custom
+    tool: any_tool
+    outputs:
+      out:
+        pattern: /tmp/x.txt
+        type: file
+`);
+  expect(def.nodes[0].type).toBe("custom");
+  if (def.nodes[0].type === "custom") {
+    expect(def.nodes[0].tool).toBe("any_tool");
+  }
+});
+
+// ── custom 节点 script 字段解析 ──
+
+// 解析 slurm 工具的 script.content + script.env
+test("解析 slurm 工具的 script.content + script.env", () => {
+  const registry = createFakeRegistry([{ name: "slurm", produces: ["*"], kind: "slurm" }]);
+  const def = parseWorkflowYaml(
+    `\
+schema_version: '1'
+name: test
+nodes:
+  - id: job1
+    type: custom
+    tool: slurm
+    script:
+      content: |
+        echo hello
+        echo $WORK_DIR
+      env:
+        WORK_DIR: /data
+    outputs:
+      out:
+        pattern: /tmp/out
+        type: file
+`,
+    undefined,
+    { customRegistry: registry },
+  );
+  expect(def.nodes[0].type).toBe("custom");
+  if (def.nodes[0].type === "custom") {
+    expect(def.nodes[0].script).toBeDefined();
+    expect(def.nodes[0].script?.content).toContain("echo hello");
+    expect(def.nodes[0].script?.env?.WORK_DIR).toBe("/data");
+  }
+});
+
+// slurm 工具缺少 script 字段报错
+test("slurm 工具缺少 script 字段报错", () => {
+  const registry = createFakeRegistry([{ name: "slurm", produces: ["*"], kind: "slurm" }]);
+  expect(() =>
+    parseWorkflowYaml(
+      `\
+schema_version: '1'
+name: test
+nodes:
+  - id: job1
+    type: custom
+    tool: slurm
+    outputs:
+      out:
+        pattern: /tmp/out
+        type: file
+`,
+      undefined,
+      { customRegistry: registry },
+    ),
+  ).toThrow(/script\.content/);
+});
+
+// slurm 工具缺少 script.content 报错
+test("slurm 工具缺少 script.content 报错", () => {
+  const registry = createFakeRegistry([{ name: "slurm", produces: ["*"], kind: "slurm" }]);
+  expect(() =>
+    parseWorkflowYaml(
+      `\
+schema_version: '1'
+name: test
+nodes:
+  - id: job1
+    type: custom
+    tool: slurm
+    script:
+      env:
+        FOO: bar
+    outputs:
+      out:
+        pattern: /tmp/out
+        type: file
+`,
+      undefined,
+      { customRegistry: registry },
+    ),
+  ).toThrow(/script\.content/);
+});
+
+// 非 slurm 工具声明 script 字段报错
+test("非 slurm 工具声明 script 字段报错", () => {
+  const registry = createFakeRegistry([{ name: "plain_tool", produces: ["out"], kind: "default" }]);
+  expect(() =>
+    parseWorkflowYaml(
+      `\
+schema_version: '1'
+name: test
+nodes:
+  - id: job1
+    type: custom
+    tool: plain_tool
+    script:
+      content: echo hi
+    outputs:
+      out:
+        pattern: /tmp/out
+        type: file
+`,
+      undefined,
+      { customRegistry: registry },
+    ),
+  ).toThrow(/does not support 'script'/);
+});
+
+// script.env 非字符串 value 被 warn 并跳过
+test("script.env 非字符串 value 被 warn 并跳过", () => {
+  const registry = createFakeRegistry([{ name: "slurm", produces: ["*"], kind: "slurm" }]);
+  const def = parseWorkflowYaml(
+    `\
+schema_version: '1'
+name: test
+nodes:
+  - id: job1
+    type: custom
+    tool: slurm
+    script:
+      content: echo hi
+      env:
+        VALID: ok
+        BAD_NUM: 123
+        BAD_BOOL: true
+    outputs:
+      out:
+        pattern: /tmp/out
+        type: file
+`,
+    undefined,
+    { customRegistry: registry },
+  );
+  if (def.nodes[0].type === "custom") {
+    expect(def.nodes[0].script?.env?.VALID).toBe("ok");
+    expect(def.nodes[0].script?.env?.BAD_NUM).toBeUndefined();
+    expect(def.nodes[0].script?.env?.BAD_BOOL).toBeUndefined();
+  }
+});
+
+// shell 节点声明 outputs 被解析到 ShellNodeDef.outputs（继承自 BaseNodeDef）
+test("shell 节点声明 outputs 被解析到 ShellNodeDef.outputs", () => {
+  const yamlStr = `
+schema_version: "1"
+name: test
+nodes:
+  - id: s1
+    type: shell
+    command: echo hi
+    outputs:
+      result:
+        pattern: /tmp/out.txt
+        type: file
+`;
+  const wf = parseWorkflowYaml(yamlStr);
+  const node = wf.nodes[0];
+  expect(node.type).toBe("shell");
+  expect(node.outputs).toEqual({
+    result: { pattern: "/tmp/out.txt", type: "file" },
+  });
 });

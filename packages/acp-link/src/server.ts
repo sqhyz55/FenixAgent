@@ -1,12 +1,18 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import { createCcbHandler } from "@fenix/ccb";
+import { createClaudeCodeHandler } from "@fenix/claude-code";
+import { createOpencodeHandler } from "@fenix/opencode";
 import type { AgentLaunchSpec } from "@fenix/plugin-sdk";
 import { handleFileOp } from "./client/file-operations.js";
-import { type AgentType, InstanceManager } from "./client/instance-manager.js";
+import { type AgentType, type EngineHandler, InstanceManager } from "./client/instance-manager.js";
 import { SessionManager } from "./client/session-manager.js";
 import { initRegistry } from "./client/workspace-registry.js";
+import { extractModelState, extractModeState } from "./config-options-utils.js";
 import {
   ACP_METHOD,
   createErrorResponse,
@@ -61,8 +67,14 @@ export interface ServerConfig {
   tenantId?: string;
   userId?: string;
   labels?: string[];
-  /** Agent 类型：opencode（默认）或 ccb（Claude Code） */
+  /** Agent 类型：opencode（默认）、ccb、claude-code */
   agentType?: AgentType;
+  /** 支持的引擎类型列表，注册时上报给 RCS */
+  supportedEngineTypes?: { type: string; cliPath?: string }[];
+  /** 用户指定的机器显示名称，可选 */
+  name?: string;
+  /** 客户端指定的 machine id（可选），用于固定 machine 标识 */
+  machineId?: string;
 }
 
 export interface AcpServerHandle {
@@ -86,24 +98,18 @@ interface ClientState {
   promptCapabilities: PromptCapabilities | null;
   modelState: SessionModelState | null;
   modeState: {
-    availableModes: Array<{ id: string; name: string; description?: string | null }>;
+    availableModes: Array<{
+      id: string;
+      name: string;
+      description?: string | null;
+    }>;
     currentModeId: string;
   } | null;
   isAlive: boolean;
 }
 
-// Permission request timeout (5 minutes)
-const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000;
-
 // Heartbeat interval for WebSocket ping/pong (30 seconds)
 const HEARTBEAT_INTERVAL_MS = 30_000;
-
-// Generate unique permission request ID
-let _permId = 0;
-function generatePermRequestId(): string {
-  _permId += 1;
-  return `perm_${Date.now()}_${_permId}`;
-}
 
 function cancelPendingPermissions(clientState: ClientState): void {
   for (const [, pending] of clientState.pendingPermissions) {
@@ -114,10 +120,35 @@ function cancelPendingPermissions(clientState: ClientState): void {
 }
 
 // ---------------------------------------------------------------------------
+// Node identity persistence: 持久化 machine_id 避免重复注册
+// ---------------------------------------------------------------------------
+
+const NODE_ID_FILENAME = ".acp-link-node-id";
+
+/** 从 cwd 加载持久化的 node_id（上次注册时服务器分配的 machine_id） */
+async function loadNodeId(cwd: string): Promise<string | null> {
+  try {
+    const id = (await readFile(join(cwd, NODE_ID_FILENAME), "utf-8")).trim();
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
+/** 将 node_id 持久化到 cwd，后续重连时携带以精确匹配已有 machine 记录 */
+async function saveNodeId(cwd: string, machineId: string): Promise<void> {
+  try {
+    await writeFile(join(cwd, NODE_ID_FILENAME), machineId, "utf-8");
+  } catch (err) {
+    console.error("[acp-client] Failed to persist node_id:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Registry helpers: build register message for RCS client mode
 // ---------------------------------------------------------------------------
 
-export function buildRegisterMessage(config: ServerConfig): object {
+export function buildRegisterMessage(config: ServerConfig, nodeId?: string | null): object {
   let ip = "127.0.0.1";
   let mac = "";
   try {
@@ -137,9 +168,10 @@ export function buildRegisterMessage(config: ServerConfig): object {
     // fallback to 127.0.0.1
   }
 
-  return {
+  const msg: Record<string, unknown> = {
     type: "register",
     agent_name: config.command,
+    name: config.name ?? null,
     max_sessions: 5,
     capabilities: { streaming: true },
     machine_info: {
@@ -151,9 +183,25 @@ export function buildRegisterMessage(config: ServerConfig): object {
     },
     labels: config.labels ?? [],
     heartbeat_interval_ms: 30000,
+    supported_engine_types: config.supportedEngineTypes ?? [
+      { type: "opencode" },
+      ...(process.env.CLAUDE_CODE_CLI_PATH ? [{ type: "claude-code", cliPath: process.env.CLAUDE_CODE_CLI_PATH }] : []),
+    ],
     tenant_id: config.tenantId ?? null,
     user_id: config.userId ?? null,
   };
+
+  // 携带持久化的 node_id，服务端据此精确匹配已有记录，避免重复注册
+  if (nodeId) {
+    msg.node_id = nodeId;
+  }
+
+  // 客户端指定的 machine id，用于固定机器标识
+  if (config.machineId) {
+    msg.machine_id = config.machineId;
+  }
+
+  return msg;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,11 +213,17 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
     throw new Error("rcsUrl is required for client mode");
   }
 
+  const cwd = config.cwd || process.cwd();
   const sessionMgr = new SessionManager(config.command, 5, config.cwd || process.cwd());
-  const instanceMgr = new InstanceManager(config.command, config.cwd || process.cwd(), config.args, config.agentType);
+  const handlers: Record<string, EngineHandler> = {
+    opencode: createOpencodeHandler(config.command, config.args),
+    ccb: createCcbHandler(),
+    "claude-code": createClaudeCodeHandler(),
+  };
+  const instanceMgr = new InstanceManager(handlers, config.cwd || process.cwd(), config.agentType ?? "opencode");
 
   // 从磁盘加载 workspace 映射（acp-link 重启后恢复）
-  initRegistry(config.cwd || process.cwd()).catch((err) => {
+  initRegistry(cwd).catch((err) => {
     console.error("[acp-client] Failed to load workspace registry:", err);
   });
   const url = `${config.rcsUrl}/acp/ws?secret=${encodeURIComponent(config.rcsSecret ?? "")}`;
@@ -180,21 +234,41 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
   let reconnectAttempt = 0;
   const MAX_RECONNECT_MS = 30_000;
   let manualClose = false;
+  // 持久化的 node_id，首次注册后由服务器分配，后续重连携带以精确匹配
+  let cachedNodeId: string | null = null;
 
   function setupSessionCallbacks(): void {
     sessionMgr.on("session_data", (sessionId: string, payload: unknown) => {
       if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: "session_data", session_id: sessionId, payload }));
+        ws.send(
+          JSON.stringify({
+            type: "session_data",
+            session_id: sessionId,
+            payload,
+          }),
+        );
       }
     });
     sessionMgr.on("session_ended", (sessionId: string, exitCode: number) => {
       if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: "session_ended", session_id: sessionId, reason: `exit code ${exitCode}` }));
+        ws.send(
+          JSON.stringify({
+            type: "session_ended",
+            session_id: sessionId,
+            reason: `exit code ${exitCode}`,
+          }),
+        );
       }
     });
     sessionMgr.on("session_error", (sessionId: string, error: string) => {
       if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: "session_error", session_id: sessionId, error }));
+        ws.send(
+          JSON.stringify({
+            type: "session_error",
+            session_id: sessionId,
+            error,
+          }),
+        );
       }
     });
   }
@@ -207,11 +281,16 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
 
     ws.onopen = () => {
       reconnectAttempt = 0;
-      ws!.send(JSON.stringify(buildRegisterMessage(config)));
+      ws!.send(JSON.stringify(buildRegisterMessage(config, cachedNodeId)));
 
       // 重连后：为所有存活的子进程发送 session_resumed
       for (const sessionId of sessionMgr.getAliveSessionIds()) {
-        ws!.send(JSON.stringify({ type: "session_resumed", session_id: sessionId }));
+        ws!.send(
+          JSON.stringify({
+            type: "session_resumed",
+            session_id: sessionId,
+          }),
+        );
       }
     };
 
@@ -225,6 +304,11 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
         switch (msg.type) {
           case "registered": {
             console.log("[acp-client] registered successfully, machineId:", msg.machine_id);
+            // 持久化服务器分配的 machine_id 作为 node_id，后续重连精确匹配
+            if (msg.machine_id && msg.machine_id !== cachedNodeId) {
+              cachedNodeId = msg.machine_id;
+              saveNodeId(cwd, msg.machine_id).catch(() => {});
+            }
             heartbeatTimer = setInterval(() => {
               if (ws && ws.readyState === 1) {
                 ws.send(JSON.stringify({ type: "heartbeat" }));
@@ -252,11 +336,20 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
               fileWs.onopen = () => {
                 console.log("[acp-client] file-ws connected, registering...");
                 if (fileWs && fileWs.readyState === 1) {
-                  fileWs.send(JSON.stringify({ type: "register", machine_id: msg.machine_id }));
+                  fileWs.send(
+                    JSON.stringify({
+                      type: "register",
+                      machine_id: msg.machine_id,
+                    }),
+                  );
                 }
                 fileWsHeartbeat = setInterval(() => {
                   if (fileWs && fileWs.readyState === 1) {
-                    fileWs.send(JSON.stringify({ type: "keep_alive" }));
+                    fileWs.send(
+                      JSON.stringify({
+                        type: "keep_alive",
+                      }),
+                    );
                   }
                 }, 30000);
               };
@@ -292,13 +385,13 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
             const sessionId = msg.session_id as string;
             const launchSpec = msg.launch_spec;
 
+            // 旧 SessionManager 路径（向后兼容）
             if (launchSpec) {
               console.log(`[acp-client] session_start with launch_spec for ${sessionId}`);
               if (msg.agent_prompt) {
                 sessionMgr.setSystemPrompt?.(msg.agent_prompt as string);
               }
               sessionMgr.startSession(sessionId, launchSpec as Record<string, unknown>).then((result) => {
-                console.log("[acp-client] startSession done:", result, "ws:", ws?.readyState);
                 if (ws && ws.readyState === 1) {
                   if (result === "started") {
                     const caps = sessionMgr.getCapabilities?.() ?? {};
@@ -306,16 +399,27 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
                       JSON.stringify({
                         type: "session_started",
                         session_id: sessionId,
-                        payload: { capabilities: caps },
+                        payload: {
+                          capabilities: caps,
+                        },
                       }),
                     );
                   } else if (result === "queued") {
-                    ws.send(JSON.stringify({ type: "session_queued", session_id: sessionId }));
+                    ws.send(
+                      JSON.stringify({
+                        type: "session_queued",
+                        session_id: sessionId,
+                      }),
+                    );
                   } else {
-                    ws.send(JSON.stringify({ type: "session_error", session_id: sessionId, error: "spawn failed" }));
+                    ws.send(
+                      JSON.stringify({
+                        type: "session_error",
+                        session_id: sessionId,
+                        error: "spawn failed",
+                      }),
+                    );
                   }
-                } else {
-                  console.log("[acp-client] ws not ready, state:", ws?.readyState);
                 }
               });
             } else {
@@ -324,7 +428,6 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
                 sessionMgr.setSystemPrompt?.(msg.agent_prompt as string);
               }
               sessionMgr.startSession(sessionId).then((result) => {
-                console.log("[acp-client] startSession done:", result, "ws:", ws?.readyState);
                 if (ws && ws.readyState === 1) {
                   if (result === "started") {
                     const caps = sessionMgr.getCapabilities?.() ?? {};
@@ -332,44 +435,58 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
                       JSON.stringify({
                         type: "session_started",
                         session_id: sessionId,
-                        payload: { capabilities: caps },
+                        payload: {
+                          capabilities: caps,
+                        },
                       }),
                     );
                   } else if (result === "queued") {
-                    ws.send(JSON.stringify({ type: "session_queued", session_id: sessionId }));
+                    ws.send(
+                      JSON.stringify({
+                        type: "session_queued",
+                        session_id: sessionId,
+                      }),
+                    );
                   } else {
-                    ws.send(JSON.stringify({ type: "session_error", session_id: sessionId, error: "spawn failed" }));
+                    ws.send(
+                      JSON.stringify({
+                        type: "session_error",
+                        session_id: sessionId,
+                        error: "spawn failed",
+                      }),
+                    );
                   }
-                } else {
-                  console.log("[acp-client] ws not ready, state:", ws?.readyState);
                 }
               });
             }
             break;
           }
-          case "session_data":
-            // 优先走 InstanceManager AcpDispatcher，否则走旧 SessionManager
-            if (instanceMgr.hasInstance(msg.session_id)) {
-              const dispatcher = instanceMgr.getDispatcher(msg.session_id);
-              if (dispatcher) {
-                await dispatcher.handleMessage(msg.payload);
-              }
+          case "session_data": {
+            const instId = (msg.instance_id as string) ?? (msg.session_id as string);
+            if (instId && instanceMgr.hasInstance(instId)) {
+              const dispatcher = instanceMgr.getDispatcher(instId);
+              if (dispatcher) await dispatcher.handleMessage(msg.payload);
             } else {
-              sessionMgr.sendData(msg.session_id, msg.payload);
+              sessionMgr.sendData(msg.session_id as string, msg.payload);
             }
             break;
-          case "session_end":
-            if (instanceMgr.hasInstance(msg.session_id)) {
-              instanceMgr.stop(msg.session_id);
+          }
+          case "session_end": {
+            const instId = (msg.instance_id as string) ?? (msg.session_id as string);
+            if (instId && instanceMgr.hasInstance(instId)) {
+              instanceMgr.stop(instId);
             } else {
-              sessionMgr.endSession(msg.session_id);
+              sessionMgr.endSession(msg.session_id as string);
             }
             break;
+          }
           case "prepare": {
             const instId = msg.instance_id as string;
             const launchSpec = msg.launch_spec as AgentLaunchSpec;
+            const engineType = msg.engine_type as string | undefined;
             try {
-              await instanceMgr.prepare(instId, launchSpec);
+              // InstanceManager 支持多引擎，传入 engine_type 即可切换引擎
+              await instanceMgr.prepare(instId, launchSpec, engineType);
               ws!.send(
                 JSON.stringify({
                   type: "prepare_result",
@@ -394,19 +511,18 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
           case "start": {
             const instId = msg.instance_id as string;
             try {
-              // send 回调：dispatcher 的 ACP 回复通过 relay 消息发回 RCS
-              // payload 直接传入消息对象（JSON-RPC 或传输层消息）
+              // start 统一走 InstanceManager（稳定路径）
               const relaySend = (msgObj: unknown) => {
                 if (ws && ws.readyState === 1) {
-                  const relayMsg = {
-                    type: "relay",
-                    instance_id: instId,
-                    session_id: instId,
-                    payload: msgObj,
-                  };
-                  // ── ACP 调试日志 ──
-                  console.log("[acp-client] → RCS relay:", JSON.stringify(relayMsg).slice(0, 500));
-                  ws.send(JSON.stringify(relayMsg));
+                  const sessId = instanceMgr.getSessionId(instId) ?? instId;
+                  ws.send(
+                    JSON.stringify({
+                      type: "relay",
+                      instance_id: instId,
+                      session_id: sessId,
+                      payload: msgObj,
+                    }),
+                  );
                 }
               };
               const result = await instanceMgr.start(instId, relaySend);
@@ -461,6 +577,10 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
             const instId = msg.instance_id as string;
             const sessId = msg.session_id as string;
             const relayPayload = msg.payload;
+            // 回写前端 session_id 到实例 state，使 relaySend 回传时使用正确的会话标识
+            if (sessId) {
+              instanceMgr.setSessionId(instId, sessId);
+            }
             // ── ACP 调试日志 ──
             console.log("[acp-client] relay → dispatcher:", JSON.stringify(relayPayload).slice(0, 500));
             if (instanceMgr.hasInstance(instId)) {
@@ -522,7 +642,15 @@ export function createAcpClient(config: ServerConfig): { close: () => void } {
     };
   }
 
-  connect();
+  // 先加载持久化的 node_id，完成后建立连接（确保首次注册即带上 node_id）
+  loadNodeId(cwd)
+    .then((id) => {
+      cachedNodeId = id;
+      if (!manualClose) connect();
+    })
+    .catch(() => {
+      if (!manualClose) connect();
+    });
 
   return {
     close: () => {
@@ -544,6 +672,9 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
   const { port, host, command, args, cwd } = config;
   const extraEnv = config.env ?? {};
 
+  /** requestPermission 等待前端响应的超时毫秒数 */
+  const PERMISSION_TIMEOUT_MS = 30_000;
+
   // Per-instance state — no module-level globals
   const clients = new Map<AcpWs, ClientState>();
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -558,35 +689,50 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
 
   function createClient(ws: AcpWs, clientState: ClientState): acp.Client {
     return {
-      async requestPermission(params) {
-        const permId = generatePermRequestId();
+      // 与 remote 路径（spawnAcpAgent）行为对齐：发送 permission_request 到前端，等待用户响应。
+      // Bun WS 的 async handler 在每次 await 时会 yield 到事件循环，不会阻塞后续 WS 消息处理，
+      // 因此不会出现死锁——前端权限响应作为新的 WS 消息到达时，由独立的事件迭代处理。
+      async requestPermission(params: Record<string, unknown>) {
+        const sessionId = (params?.sessionId as string) ?? "";
+        const toolCall = (params?.toolCall as Record<string, unknown>) ?? {};
+        const toolCallId = (toolCall?.toolCallId as string) ?? "";
+        const title = (toolCall?.title as string) ?? `OpenCode tool: ${toolCallId}`;
+        const reqOptions = Array.isArray(params?.options) ? (params.options as acp.PermissionOption[]) : [];
 
-        const outcomePromise = new Promise<{ outcome: "cancelled" } | { outcome: "selected"; optionId: string }>(
-          (resolve) => {
-            const timeout = setTimeout(() => {
-              console.warn("permission request timed out:", permId);
-              clientState.pendingPermissions.delete(permId);
-              resolve({ outcome: "cancelled" });
-            }, PERMISSION_TIMEOUT_MS);
+        const requestId = `perm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-            clientState.pendingPermissions.set(permId, { jsonRpcId: permId, resolve, timeout });
-          },
-        );
+        const frontendOptions =
+          reqOptions.length > 0
+            ? reqOptions
+            : [
+                { kind: "allow_once" as const, name: "Allow Once", optionId: "allow_once" },
+                { kind: "reject_once" as const, name: "Deny", optionId: "reject_once" },
+              ];
 
-        // 发送 JSON-RPC 请求给客户端
-        sendMsg(ws, {
-          jsonrpc: "2.0",
-          id: permId,
-          method: ACP_METHOD.REQUEST_PERMISSION,
-          params: {
-            requestId: permId,
-            sessionId: params.sessionId,
-            options: params.options,
-            toolCall: params.toolCall,
-          },
+        const outcome = await new Promise<acp.RequestPermissionOutcome>((resolve) => {
+          const timer = setTimeout(() => {
+            clientState.pendingPermissions.delete(requestId);
+            resolve({ outcome: "cancelled" });
+          }, PERMISSION_TIMEOUT_MS);
+          clientState.pendingPermissions.set(requestId, {
+            jsonRpcId: requestId,
+            resolve,
+            timeout: timer,
+          });
+
+          sendMsg(ws, {
+            type: "permission_request",
+            payload: {
+              sessionId,
+              requestId,
+              options: frontendOptions,
+              toolCall: { toolCallId, title },
+              toolName: title,
+              description: title,
+            },
+          });
         });
 
-        const outcome = await outcomePromise;
         return { outcome };
       },
 
@@ -626,7 +772,10 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
     if (outcome?.outcome === "cancelled") {
       pending.resolve({ outcome: "cancelled" });
     } else if (outcome?.outcome === "selected" && typeof outcome.optionId === "string") {
-      pending.resolve({ outcome: "selected", optionId: outcome.optionId });
+      pending.resolve({
+        outcome: "selected",
+        optionId: outcome.optionId,
+      });
     } else {
       pending.resolve({ outcome: "cancelled" });
     }
@@ -643,7 +792,11 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
       console.log("agent already connected, resending status");
       sendMsg(ws, {
         type: "status",
-        payload: { connected: true, agentInfo: { name: command }, capabilities: state.agentCapabilities },
+        payload: {
+          connected: true,
+          agentInfo: { name: command },
+          capabilities: state.agentCapabilities,
+        },
       });
       return;
     }
@@ -693,15 +846,8 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
       });
 
       const agentCaps = initResult.agentCapabilities;
-      state.agentCapabilities = agentCaps
-        ? {
-            _meta: agentCaps._meta,
-            loadSession: agentCaps.loadSession,
-            mcpCapabilities: agentCaps.mcpCapabilities,
-            promptCapabilities: agentCaps.promptCapabilities,
-            sessionCapabilities: agentCaps.sessionCapabilities,
-          }
-        : null;
+      // 透传 SDK 返回的全部 capabilities，包括 configOptions 等未知字段
+      state.agentCapabilities = agentCaps ?? null;
       state.promptCapabilities = agentCaps?.promptCapabilities ?? null;
 
       console.log(
@@ -715,7 +861,11 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
 
       sendMsg(ws, {
         type: "status",
-        payload: { connected: true, agentInfo: initResult.agentInfo, capabilities: state.agentCapabilities },
+        payload: {
+          connected: true,
+          agentInfo: initResult.agentInfo,
+          capabilities: state.agentCapabilities,
+        },
       });
 
       connection.closed.then(() => {
@@ -726,7 +876,12 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
       });
     } catch (error) {
       console.error("agent connect failed:", (error as Error).message);
-      sendMsg(ws, { type: "error", payload: { message: `Failed to connect: ${(error as Error).message}` } });
+      sendMsg(ws, {
+        type: "error",
+        payload: {
+          message: `Failed to connect: ${(error as Error).message}`,
+        },
+      });
     }
   }
 
@@ -746,13 +901,14 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
       });
 
       state.sessionId = result.sessionId;
-      state.modelState = result.models ?? null;
-      state.modeState = result.modes ?? null;
+      state.modelState = extractModelState(result.configOptions);
+      state.modeState = result.modes ?? extractModeState(result.configOptions);
       console.log("session created:", result.sessionId, "cwd:", sessionCwd);
 
       sendMsg(
         ws,
         createSuccessResponse(id, {
+          ...result,
           sessionId: result.sessionId,
           promptCapabilities: state.promptCapabilities,
           models: state.modelState,
@@ -785,22 +941,23 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
       });
 
       const MAX_SESSIONS = 20;
-      // 过滤掉标题为空或以 "New session" 开头的会话
+      // 过滤掉标题为空或以 "New session" 开头的会话（与 acp-dispatcher/session-manager 保持一致）
       const filtered = result.sessions.filter(
-        (s) => s.title?.trim() && !s.title.trim().toLowerCase().startsWith("new session"),
+        (s: acp.SessionInfo) => s.title?.trim() && !s.title.trim().toLowerCase().startsWith("new session"),
       );
       const sessions = filtered.slice(0, MAX_SESSIONS);
-      console.log("sessions listed:", `total=${result.sessions.length}`, `returned=${sessions.length}`);
+      console.log(
+        "sessions listed:",
+        `total=${result.sessions.length}`,
+        `filtered=${filtered.length}`,
+        `returned=${sessions.length}`,
+      );
 
       sendMsg(
         ws,
         createSuccessResponse(id, {
           sessions: sessions.map((s: acp.SessionInfo) => ({
-            _meta: s._meta,
-            cwd: s.cwd,
-            sessionId: s.sessionId,
-            title: s.title,
-            updatedAt: s.updatedAt,
+            ...s,
           })),
           nextCursor: result.nextCursor,
           _meta: result._meta,
@@ -835,13 +992,14 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
       });
 
       state.sessionId = sessionId;
-      state.modelState = result.models ?? null;
-      state.modeState = result.modes ?? null;
+      state.modelState = extractModelState(result.configOptions);
+      state.modeState = result.modes ?? extractModeState(result.configOptions);
       console.log("session loaded:", sessionId, "cwd:", sessionCwd);
-
+      console.log("session load result:", result);
       sendMsg(
         ws,
         createSuccessResponse(id, {
+          ...result,
           sessionId,
           promptCapabilities: state.promptCapabilities,
           models: state.modelState,
@@ -877,13 +1035,14 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
       });
 
       state.sessionId = sessionId;
-      state.modelState = result.models ?? null;
-      state.modeState = result.modes ?? null;
+      state.modelState = extractModelState(result.configOptions);
+      state.modeState = result.modes ?? extractModeState(result.configOptions);
       console.log("session resumed:", sessionId, "cwd:", sessionCwd);
 
       sendMsg(
         ws,
         createSuccessResponse(id, {
+          ...result,
           sessionId,
           promptCapabilities: state.promptCapabilities,
           models: state.modelState,
@@ -905,12 +1064,22 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
 
     try {
       const content = params.content as ContentBlock[];
+      const promptText = content
+        .filter((c) => c.type === "text")
+        .map((c) => (c as { text: string }).text)
+        .join(" ");
+      console.log("[acp-server] prompt:", {
+        sessionId: state.sessionId,
+        id,
+        text: promptText.slice(0, 200),
+        blocks: content.length,
+      });
       const result = await state.connection.prompt({
         sessionId: state.sessionId,
         prompt: content as acp.ContentBlock[],
       });
 
-      console.log("prompt completed, stopReason:", result.stopReason);
+      console.log("[acp-server] prompt completed:", JSON.stringify(result).slice(0, 500));
       sendMsg(ws, createSuccessResponse(id, result));
     } catch (error) {
       console.error("prompt failed:", (error as Error).message);
@@ -968,9 +1137,10 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
     try {
       const modelId = params.modelId as string;
       console.log("setting model, sessionId:", state.sessionId, "modelId:", modelId);
-      await state.connection.unstable_setSessionModel({
+      await state.connection.setSessionConfigOption?.({
         sessionId: state.sessionId,
-        modelId,
+        configId: "model",
+        value: modelId,
       });
       state.modelState = { ...state.modelState, currentModelId: modelId };
       sendMsg(ws, createSuccessResponse(id, { modelId }));
@@ -1023,6 +1193,15 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
         case "ping":
           sendMsg(ws, { type: "pong" });
           break;
+        case "cancel_pending_permissions": {
+          // 前端 relay 断连时，主服务通过 relay handle 发送此消息，
+          // 通知 acp-link server 立即取消所有待决权限请求，避免 agent 等待 30s 超时。
+          const state = clients.get(ws);
+          if (state) {
+            cancelPendingPermissions(state);
+          }
+          break;
+        }
       }
       return;
     }
@@ -1104,7 +1283,10 @@ export function createAcpServer(config: ServerConfig): AcpServerHandle {
           return;
         }
         console.error("message error:", (error as Error).message);
-        sendMsg(ws, { type: "error", payload: { message: `Error: ${(error as Error).message}` } });
+        sendMsg(ws, {
+          type: "error",
+          payload: { message: `Error: ${(error as Error).message}` },
+        });
       }
     },
     close(ws: AcpWs) {

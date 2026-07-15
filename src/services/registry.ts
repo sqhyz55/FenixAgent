@@ -8,13 +8,6 @@ function genId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().slice(0, 22)}`;
 }
 
-function deriveMachineId(machineInfo: Record<string, unknown> | null): string {
-  const ip = (machineInfo?.ip as string) ?? "0.0.0.0";
-  const mac = (machineInfo?.mac as string) ?? "";
-  const os = (machineInfo?.os as string) ?? "unknown";
-  return `mach_${ip}_${os}_${mac}`;
-}
-
 export async function listMachines(
   ctx: AuthContext,
   filters: { status?: "online" | "offline"; labels?: string[]; limit?: number; offset?: number },
@@ -120,24 +113,120 @@ export async function listEvents(
   return { data: rows, total: countRows[0].count };
 }
 
+/**
+ * 管理员预创建机器记录（status=pending）。
+ * 返回 machine id 和包含 RCS_MACHINE_ID + RCS_SECRET 的初始化命令。
+ */
+export async function createMachine(
+  ctx: AuthContext,
+  params: { name: string; labels?: string[]; agentName?: string },
+): Promise<{ id: string; name: string; status: "pending"; initCommand: string }> {
+  const id = genId("mach");
+  const now = new Date();
+  const agentName = params.agentName ?? "opencode";
+  const labels = params.labels ?? [];
+
+  await db.insert(machine).values({
+    id,
+    organizationId: ctx.organizationId,
+    userId: null,
+    agentName,
+    name: params.name,
+    status: "pending",
+    machineInfo: null,
+    labels,
+    heartbeatIntervalMs: 30000,
+    lastHeartbeatAt: null,
+    registeredAt: now,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  const initCommand = [
+    `RCS_MACHINE_ID=${id}`,
+    `RCS_SECRET=<your-registry-secret>`,
+    `AGENT_TYPE=${agentName}`,
+    `acp-runtime ${agentName} acp`,
+  ].join(" ");
+
+  return { id, name: params.name, status: "pending", initCommand };
+}
+
 export async function registerMachine(params: {
+  name: string | null;
   agentName: string;
   machineInfo: Record<string, unknown> | null;
   labels: string[];
   heartbeatIntervalMs: number;
   tenantId: string | null;
   userId: string | null;
-}): Promise<{ id: string }> {
+  /** 客户端持久化的 node_id，用于精确去重（避免 IP/MAC 变化导致重复注册） */
+  nodeId?: string | null;
+  /** 客户端指定的 machine id（可选），有值时跳过 ID 生成和去重，直接用该 ID */
+  machineId?: string | null;
+}): Promise<{ id: string; isNew: boolean }> {
   const hostname = params.machineInfo?.hostname as string | undefined;
-  const id = deriveMachineId(params.machineInfo);
   let existingId: string | null = null;
 
-  // dedup by derived ID (ip+os+mac → same ID)
-  const existing = await db.select({ id: machine.id }).from(machine).where(eq(machine.id, id)).limit(1);
-  existingId = existing[0]?.id ?? null;
+  // ── 客户端指定 machineId 分支：验证预创建记录并激活 ──
+  if (params.machineId) {
+    const existing = await db
+      .select({ id: machine.id, status: machine.status })
+      .from(machine)
+      .where(eq(machine.id, params.machineId))
+      .limit(1);
 
+    // machine 不存在：必须在组织管理界面先创建
+    if (existing.length === 0) {
+      throw new Error(`machine '${params.machineId}' not found, please create it first in your organization`);
+    }
+
+    const now = new Date();
+
+    // 已在线：不允许另一个 client 接管
+    if (existing[0].status === "online") {
+      throw new Error(`machine id '${params.machineId}' is already online`);
+    }
+
+    const isFirstRegistration = existing[0].status === "pending";
+    const eventType = isFirstRegistration ? "register" : "reconnect";
+
+    // pending 或 offline → 激活为 online，同步更新字段
+    await db
+      .update(machine)
+      .set({
+        status: "online",
+        organizationId: params.tenantId ?? null,
+        userId: params.userId ?? null,
+        machineInfo: params.machineInfo,
+        labels: params.labels,
+        name: params.name,
+        heartbeatIntervalMs: params.heartbeatIntervalMs,
+        lastHeartbeatAt: now,
+        updatedAt: now,
+      })
+      .where(eq(machine.id, params.machineId));
+
+    await db.insert(registryEvent).values({
+      id: genId("evt"),
+      machineId: params.machineId,
+      type: eventType,
+      detail: { machine_info: params.machineInfo, labels: params.labels },
+    });
+
+    await bindAgentConfigs(params.machineId, params.agentName, params.tenantId);
+    return { id: params.machineId, isNew: isFirstRegistration };
+  }
+
+  // ── 去重策略（machineId 未指定时走此分支）──
+  // 优先级 1：按客户端持久化的 node_id 精确匹配（最可靠，跨 IP/MAC 变化稳定）
+  if (params.nodeId) {
+    const byNodeId = await db.select({ id: machine.id }).from(machine).where(eq(machine.id, params.nodeId)).limit(1);
+    existingId = byNodeId[0]?.id ?? null;
+  }
+
+  // 优先级 2：fallback 按 hostname + agentName 查找（兼容旧客户端或 node_id 丢失）
   if (!existingId && hostname) {
-    // fallback dedup by hostname + agentName
     const byHostname = await db
       .select({ id: machine.id })
       .from(machine)
@@ -148,6 +237,7 @@ export async function registerMachine(params: {
 
   const now = new Date();
 
+  // ── 已存在的机器重连：更新状态，写 reconnect 事件 ──
   if (existingId) {
     await db
       .update(machine)
@@ -155,28 +245,33 @@ export async function registerMachine(params: {
         status: "online",
         machineInfo: params.machineInfo,
         labels: params.labels,
+        name: params.name,
         heartbeatIntervalMs: params.heartbeatIntervalMs,
         lastHeartbeatAt: now,
         updatedAt: now,
       })
       .where(eq(machine.id, existingId));
 
+    // 重连事件与首次注册区分，避免 registry_event 表堆积无意义的重复 register 记录
     await db.insert(registryEvent).values({
       id: genId("evt"),
       machineId: existingId,
-      type: "register",
+      type: "reconnect",
       detail: { machine_info: params.machineInfo, labels: params.labels },
     });
 
     await bindAgentConfigs(existingId, params.agentName, params.tenantId);
-    return { id: existingId };
+    return { id: existingId, isNew: false };
   }
 
+  // ── 新机器首次注册：生成随机 ID，写 register 事件 ──
+  const id = genId("mach");
   await db.insert(machine).values({
     id,
     organizationId: params.tenantId ?? null,
     userId: params.userId ?? null,
     agentName: params.agentName,
+    name: params.name,
     status: "online",
     machineInfo: params.machineInfo,
     labels: params.labels,
@@ -195,7 +290,7 @@ export async function registerMachine(params: {
   });
 
   await bindAgentConfigs(id, params.agentName, params.tenantId);
-  return { id };
+  return { id, isNew: true };
 }
 
 export async function disconnectMachine(machineId: string, reason: string): Promise<void> {

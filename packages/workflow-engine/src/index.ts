@@ -11,6 +11,7 @@ export { AgentExecutor } from "./executor/agent-executor";
 export { ApiExecutor } from "./executor/api-executor";
 export type { PendingApproval } from "./executor/awaitable-executor";
 export { AuditExecutor, verifyApprovalToken } from "./executor/awaitable-executor";
+export { EndExecutor } from "./executor/end-executor";
 export { LoopExecutor } from "./executor/loop-executor";
 export { createNodeExecutorRegistry, NodeExecutorRegistry } from "./executor/node-executor";
 // 执行器
@@ -26,7 +27,17 @@ export type { ResolvedInput } from "./parser/inputs-resolver";
 // Inputs 解析器
 export { generatePythonPreamble, generateShellEnvVars, resolveInputs } from "./parser/inputs-resolver";
 // 解析器
+export type { ParseOptions } from "./parser/yaml-parser";
 export { parseWorkflowYaml } from "./parser/yaml-parser";
+export { CustomNodeExecutor } from "./plugins/custom-executor";
+export type { JobTransport } from "./plugins/job-transport";
+export { SshJobTransport } from "./plugins/job-transport";
+export { CustomNodeRegistry } from "./plugins/registry";
+export { BunSshExecutor, mapSlurmState, SlurmNode } from "./plugins/slurm-node";
+// SlurmNode 插件
+export type { JobResult, ScriptDef, SlurmConfig, SshExecutor } from "./plugins/slurm-types";
+// 自定义节点插件系统
+export type { CustomNode, ExecuteContext, InputDef } from "./plugins/types";
 export type { RecoveryResult } from "./recovery/snapshot-recovery";
 export { recoverRun } from "./recovery/snapshot-recovery";
 export { CancellationManager } from "./scheduler/cancellation";
@@ -48,6 +59,7 @@ export type {
   ApiNodeDef,
   AuditNodeDef,
   BaseNodeDef,
+  CustomNodeDef,
   LoopBody,
   LoopNodeDef,
   NodeDef,

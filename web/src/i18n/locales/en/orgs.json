@@ -18,6 +18,19 @@
   "members": "Members ({{count}})",
   "inviteMember": "Add Member",
   "noMembers": "No members yet",
+  "machines": "Machines ({{count}})",
+  "noMachines": "No machines yet",
+  "machineStatus": {
+    "online": "Online",
+    "offline": "Offline"
+  },
+  "machineAgent": "Agent",
+  "machineHost": "Host",
+  "machineLabels": "Labels",
+  "machineLastSeen": "Last Heartbeat",
+  "machineNever": "Never",
+  "machineRefresh": "Refresh",
+  "machineRefreshing": "Refreshing...",
   "table": {
     "user": "User",
     "role": "Role",
@@ -39,8 +52,8 @@
   },
   "inviteDialog": {
     "title": "Add Member",
-    "email": "Email",
-    "emailPlaceholder": "Enter email address",
+    "email": "Email or Phone",
+    "emailPlaceholder": "Enter an email address or phone number",
     "role": "Role",
     "invite": "Add",
     "inviting": "Adding..."
@@ -51,11 +64,32 @@
     "confirmDelete": "Confirm Delete",
     "deleting": "Deleting..."
   },
+  "removeMemberDialog": {
+    "title": "Confirm Remove Member",
+    "description": "You are about to remove member \"{{name}}\" from this organization. They will lose access to all resources in it.",
+    "confirmRemove": "Confirm Remove",
+    "removing": "Removing..."
+  },
   "orgId": "Organization ID",
   "copyId": "Copy ID",
   "copied": "Copied",
   "editName": {
     "placeholder": "Organization name"
+  },
+  "done": "Done",
+  "machineId": "Machine ID",
+  "addMachine": "Add Machine",
+  "createMachineDialog": {
+    "title": "Add Machine",
+    "name": "Machine Name",
+    "namePlaceholder": "e.g. sandbox-01",
+    "labels": "Labels",
+    "labelsPlaceholder": "Comma separated, e.g. sandbox,production",
+    "agentName": "Engine Type",
+    "agentNamePlaceholder": "Select engine type",
+    "resultTitle": "Machine Created",
+    "resultDesc": "Share the following information with the machine administrator. Set the environment variables on the client before starting acp-runtime.",
+    "initCommand": "Init Command"
   },
   "toast": {
     "loadDetailFailed": "Failed to load organization details",
@@ -70,7 +104,9 @@
     "roleUpdated": "Role updated",
     "roleUpdateFailed": "Failed to update role",
     "deleteSuccess": "Organization deleted",
-    "deleteFailed": "Failed to delete organization"
+    "deleteFailed": "Failed to delete organization",
+    "machineCreateSuccess": "Machine {{name}} created (ID: {{id}})",
+    "machineCreateFailed": "Failed to create machine"
   },
   "error": {
     "operationFailed": "Operation failed"

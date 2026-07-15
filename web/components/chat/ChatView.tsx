@@ -1,3 +1,4 @@
+import { useCallback, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import type { PlanDisplayEntry, ThreadEntry, ToolCallEntry } from "../../src/lib/types";
 import { cn } from "../../src/lib/utils";
@@ -7,6 +8,7 @@ import {
   ConversationEmptyState,
   ConversationScrollButtons,
 } from "../ai-elements/conversation";
+import { AgentBadge, AgentBadgeSkeleton, type AgentSkillInfo } from "./AgentBadge";
 import { AssistantBubble, UserBubble } from "./MessageBubble";
 import { PlanDisplay } from "./PlanView";
 import { ToolCallGroup } from "./ToolCallGroup";
@@ -22,6 +24,9 @@ interface ChatViewProps {
   onPermissionRespond?: (requestId: string, optionId: string | null, optionKind: string | null) => void;
   emptyTitle?: string;
   emptyDescription?: string;
+  agentName?: string;
+  agentDescription?: string;
+  agentSkills?: AgentSkillInfo[];
   sessionId?: string;
   envId?: string;
 }
@@ -30,20 +35,48 @@ export function ChatView({
   entries,
   isLoading = false,
   onPermissionRespond,
-  emptyTitle = "开始对话",
-  emptyDescription = "输入消息开始聊天",
+  emptyTitle,
+  emptyDescription,
+  agentName,
+  agentDescription,
+  agentSkills,
   sessionId,
   envId,
 }: ChatViewProps) {
+  const { t } = useTranslation("components");
+  const finalEmptyTitle = emptyTitle ?? t("chatView.startConversation");
+  const finalEmptyDescription = emptyDescription ?? t("chatView.startConversationDesc");
   // 将相邻的 ToolCallEntry 合并为一组
   const grouped = groupToolCalls(entries);
   const hasMessages = entries.length > 0;
+
+  // debug：Ctrl+P 打印 entries 到控制台
+  const handleDebugEntries = useCallback(() => {
+    console.log("[ChatView] entries:", JSON.parse(JSON.stringify(entries)));
+  }, [entries]);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === "p") {
+        e.preventDefault();
+        handleDebugEntries();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [handleDebugEntries]);
 
   return (
     <Conversation className="flex-1">
       <ConversationContent>
         {!hasMessages ? (
-          <ConversationEmptyState title={emptyTitle} description={emptyDescription} />
+          isLoading && !agentName ? (
+            <AgentBadgeSkeleton />
+          ) : agentName ? (
+            <AgentBadge name={agentName} description={agentDescription} skills={agentSkills ?? []} />
+          ) : (
+            <ConversationEmptyState title={finalEmptyTitle} description={finalEmptyDescription} />
+          )
         ) : (
           <>
             {grouped.map((item, i) => {

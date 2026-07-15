@@ -1,5 +1,6 @@
 import { ArrowLeft, Edit3, Loader, RefreshCw, ShieldCheck, Square } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { unwrap } from "@/src/api/request";
 import {
   type DAGEvent,
   type DAGSnapshot,
@@ -83,8 +84,8 @@ export function RunStatusPanel({
           setSelectedNodeOutput(null);
           try {
             const [snap, evts] = await Promise.all([
-              workflowEngineApi.getRunStatus(runId),
-              workflowEngineApi.getEvents(runId),
+              unwrap(workflowEngineApi.getRunStatus(runId)),
+              unwrap(workflowEngineApi.getEvents(runId)),
             ]);
             if (snap) {
               setRunSnapshot(snap);
@@ -177,8 +178,8 @@ export function RunStatusPanel({
         <div className="px-3 py-1 border-b border-border-subtle text-[10px] text-text-secondary flex justify-between">
           <span>
             {t("editor.progress_nodes", {
-              completed: Object.values(runSnapshot.node_states).filter((s) => s.status === "COMPLETED").length,
-              total: Object.keys(runSnapshot.node_states).length,
+              completed: Object.values(runSnapshot.node_states ?? {}).filter((s) => s.status === "COMPLETED").length,
+              total: Object.keys(runSnapshot.node_states ?? {}).length,
             })}
           </span>
           <span className="font-mono text-[9px]">{activeRunId?.substring(0, 16)}...</span>

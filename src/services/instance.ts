@@ -2,8 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { RuntimeInstanceSnapshot } from "@fenix/core";
 import { log, error as logError } from "@fenix/logger";
 import type { AgentLaunchSpec } from "@fenix/plugin-sdk";
-import { getBaseUrl } from "../config";
-import { validateEnv } from "../env";
+import { config, getBaseUrl } from "../config";
 import { AppError, NotFoundError } from "../errors";
 import type { EnvironmentRecord } from "../repositories";
 import { environmentRepo } from "../repositories";
@@ -32,6 +31,31 @@ export interface SpawnedInstance {
   environmentId?: string;
   sessionId?: string;
   instanceNumber: number;
+}
+
+/** 对外 `/web/instances/*` API 使用的实例详情结构。 */
+export interface InstanceInfo {
+  id: string;
+  port: number;
+  status: "starting" | "running" | "stopped" | "error";
+  error: string | null;
+  group_id: string;
+  environment_id: string | null;
+  session_id: string | null;
+  instance_number: number;
+  created_at: number;
+}
+
+export interface InstanceActivityInfo extends InstanceInfo {
+  last_activity_at: number;
+  relay_count: number;
+  last_relay_detached_at: number | null;
+  idle_seconds: number;
+  idle_timeout_seconds: number;
+  idle_kill_eligible: boolean;
+  inactivity_seconds: number;
+  activity_timeout_seconds: number;
+  activity_kill_eligible: boolean;
 }
 
 export interface EnsureRunningResult {
@@ -81,6 +105,55 @@ function toSpawnedInstance(snapshot: RuntimeInstanceSnapshot, supplement: Instan
   };
 }
 
+/**
+ * 将内部实例对象转换为对外 API 契约。
+ *
+ * 这里保留 snake_case，避免路由层直接暴露内部 camelCase 结构，
+ * 否则会和 Elysia 的 response schema 校验发生偏差。
+ */
+export function toInstanceInfo(instance: SpawnedInstance): InstanceInfo {
+  const environmentId = instance.environmentId ?? null;
+  return {
+    id: instance.id,
+    port: instance.port,
+    status: instance.status,
+    error: instance.error,
+    // 现有 API 契约要求 group_id 必填；当前实例域里没有独立 group 概念，
+    // 这里沿用 environmentId 作为兼容值，后续若拆分语义需同步调整 schema 与客户端。
+    group_id: environmentId ?? "",
+    environment_id: environmentId,
+    session_id: instance.sessionId ?? null,
+    instance_number: instance.instanceNumber,
+    created_at: Math.floor(instance.createdAt.getTime() / 1000),
+  };
+}
+
+/** 将实例与 registry 中的空闲观测状态组装为监控视图。 */
+export function toInstanceActivityInfo(
+  instance: SpawnedInstance,
+  supplement: InstanceSupplement,
+  idleTimeoutSeconds: number,
+  activityTimeoutSeconds: number,
+  now = Date.now(),
+): InstanceActivityInfo {
+  const idleSince = supplement.lastRelayDetachedAt ?? now;
+  const idleSeconds = supplement.relayCount === 0 ? Math.max(0, Math.floor((now - idleSince) / 1000)) : 0;
+  const inactivitySeconds = Math.max(0, Math.floor((now - supplement.lastActivityAt) / 1000));
+  return {
+    ...toInstanceInfo(instance),
+    last_activity_at: Math.floor(supplement.lastActivityAt / 1000),
+    relay_count: supplement.relayCount,
+    last_relay_detached_at:
+      supplement.lastRelayDetachedAt === null ? null : Math.floor(supplement.lastRelayDetachedAt / 1000),
+    idle_seconds: idleSeconds,
+    idle_timeout_seconds: idleTimeoutSeconds,
+    idle_kill_eligible: supplement.relayCount === 0 && idleSeconds >= idleTimeoutSeconds,
+    inactivity_seconds: inactivitySeconds,
+    activity_timeout_seconds: activityTimeoutSeconds,
+    activity_kill_eligible: inactivitySeconds >= activityTimeoutSeconds,
+  };
+}
+
 // ────────────────────────────────────────────
 // 公共 API
 // ────────────────────────────────────────────
@@ -121,9 +194,13 @@ export async function spawnInstanceFromEnvironment(
   );
 
   // Phase 1: 注入平台级环境变量，调用方仍可通过 extraEnv 覆盖这些默认值。
+  // USER_META_USER_ID/ORG_ID 取 environment 记录中的所有者；
+  // meta-agent 等共享环境会在 ensureMetaEnvironment 中通过 extraEnv 覆盖为当前请求者的 ctx。
   const platformEnv: Record<string, string> = {
     USER_META_API_KEY: env.secret,
     USER_META_BASE_URL: getBaseUrl(),
+    USER_META_USER_ID: env.userId ?? userId,
+    USER_META_ORG_ID: env.organizationId ?? "",
   };
   const mergedExtraEnv = { ...platformEnv, ...extraEnv };
 
@@ -136,10 +213,11 @@ export async function spawnInstanceFromEnvironment(
     extraEnv: mergedExtraEnv,
   };
   let launchSpec: AgentLaunchSpec;
+  let resolvedAgentConfig: Awaited<ReturnType<typeof getReadableAgentConfigById>> = null;
   if (env.agentConfigId) {
     const agentConfigId = env.agentConfigId;
     const accessCtx = { organizationId: env.organizationId ?? "", userId, role: "owner" as const };
-    const resolvedAgentConfig = await getReadableAgentConfigById(accessCtx, agentConfigId);
+    resolvedAgentConfig = await getReadableAgentConfigById(accessCtx, agentConfigId);
     if (!resolvedAgentConfig) {
       logError(
         `[instance] spawnInstanceFromEnvironment: agentConfigId='${agentConfigId}' not found for environmentId='${environmentId}', org='${env.organizationId ?? ""}'`,
@@ -168,10 +246,13 @@ export async function spawnInstanceFromEnvironment(
   const instanceId = `inst_${randomBytes(8).toString("hex")}`;
   const instanceNumber = registry.nextInstanceNumber(environmentId);
 
-  // machineId 缺失时固定落到本地 node，避免把“未绑定远程机”误解释成启动错误。
+  // machineId 缺失时按优先级选择执行节点：
+  // agent config 绑定 > 系统环境变量 > local-default
   let nodeId = "local-default";
   if (agentMachineId) {
     nodeId = agentMachineId;
+  } else if (config.defaultMachineId) {
+    nodeId = config.defaultMachineId;
   }
 
   // 远程节点启动前连接检查
@@ -183,11 +264,13 @@ export async function spawnInstanceFromEnvironment(
   }
 
   // 委托 core 执行 launch
-  // port/token/pid 由 core-bootstrap 的 onInstanceStarted 回调写入 pluginMetadata
+  // engineType 优先级：agent config 指定 > 系统环境变量 > hardcoded "opencode"
+  const engineType =
+    (resolvedAgentConfig as Record<string, unknown> | null)?.engineType ?? config.defaultEngineType ?? "opencode";
   const facade = getCoreRuntime();
   const snapshot = await facade.launchInstance({
     instanceId,
-    engineType: validateEnv().RCS_ENGINE_TYPE,
+    engineType: engineType as string,
     nodeId,
     launchSpec,
   });
@@ -197,6 +280,9 @@ export async function spawnInstanceFromEnvironment(
     environmentId,
     instanceNumber,
     organizationId: env.organizationId ?? userId,
+    lastActivityAt: Date.now(),
+    relayCount: 0,
+    lastRelayDetachedAt: Date.now(),
   };
   registry.register(instanceId, supplement);
 

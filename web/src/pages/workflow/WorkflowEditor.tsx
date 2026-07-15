@@ -12,24 +12,22 @@ import {
   useNodesState,
   useReactFlow,
 } from "@xyflow/react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import "@xyflow/react/dist/style.css";
 import {
   Bot,
+  Boxes,
   CheckCircle,
   Code,
   Download,
-  Edit3,
-  Eye,
   FilePlus,
+  Flag,
   Globe,
   LayoutGrid,
-  Link,
   List,
   Lock,
-  MessageSquare,
   Play,
   RefreshCw,
   Rocket,
@@ -38,10 +36,13 @@ import {
   Terminal,
   Upload,
 } from "lucide-react";
+import { ConfirmDialog } from "@/components/config/ConfirmDialog";
 import { MetaAgentPanel } from "@/components/MetaAgentPanel";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { workflowDefApi } from "../../api/workflow-defs";
+import { unwrap } from "@/src/api/request";
+import { useContextQueue } from "@/src/lib/use-context-queue";
+import { type CustomToolItem, customToolsApi, type WorkflowDefItem, workflowDefApi } from "../../api/workflow-defs";
 import {
   type DAGEvent,
   type DAGSnapshot,
@@ -50,10 +51,11 @@ import {
   workflowEngineApi,
 } from "../../api/workflow-engine";
 import { connectWorkflowSSE, disconnectWorkflowSSE } from "../../api/workflow-sse";
-import { NodeConfigPopover } from "./components/NodeConfigPopover";
+import { NodeConfigSheet } from "./components/NodeConfigSheet";
 import { RunParamsDialog } from "./components/RunParamsDialog";
 import { RunStatusPanel } from "./components/RunStatusPanel";
 import { TriggerPanel } from "./components/TriggerPanel";
+import { VersionIndicator } from "./components/VersionIndicator";
 import { VersionPanel } from "./components/VersionPanel";
 import { WorkflowMetaPopover } from "./components/WorkflowMetaPopover";
 import { YamlSlidePanel } from "./components/YamlSlidePanel";
@@ -63,10 +65,18 @@ import { useWorkflowMetaAgent } from "./hooks/useWorkflowMetaAgent";
 import { useWorkflowPersistence } from "./hooks/useWorkflowPersistence";
 import { useWorkflowRun } from "./hooks/useWorkflowRun";
 import { autoLayout } from "./layout";
-import { nodeTypes } from "./nodes";
+import { nodeTypes, setToolColors } from "./nodes";
 import { TRANSFORM_PRESETS } from "./presets";
 import { dedupEvents } from "./utils";
-import { createStartNode, defaultMeta, START_NODE_ID, type WfMeta, yamlToFlow } from "./yaml-utils";
+import {
+  createStartNode,
+  defaultMeta,
+  START_NODE_ID,
+  syncEdgeCounter,
+  syncNodeCounter,
+  type WfMeta,
+  yamlToFlow,
+} from "./yaml-utils";
 import "./workflow.css";
 
 const BASIC_PALETTE_ITEMS = [
@@ -75,6 +85,7 @@ const BASIC_PALETTE_ITEMS = [
   { type: "agent", labelKey: "nodes.agent", icon: Bot, color: "#22c55e" },
   { type: "api", labelKey: "nodes.api", icon: Globe, color: "#8b5cf6" },
   { type: "audit", labelKey: "editor.palette_audit", icon: ShieldCheck, color: "#f59e0b" },
+  { type: "end", labelKey: "nodes.end", icon: Flag, color: "#22c55e" },
 ] as const;
 
 interface WorkflowEditorProps {
@@ -93,7 +104,10 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
   const [yamlOpen, setYamlOpen] = useState(false);
   const [yamlText, setYamlText] = useState("");
   const [yamlBaseText, setYamlBaseText] = useState("");
-  const [readOnly, setReadOnly] = useState(false);
+
+  // ── 版本预览状态 ──
+  const [previewVersion, setPreviewVersion] = useState<number | null>(null);
+  const [wfData, setWfData] = useState<WorkflowDefItem | null>(null);
 
   // ── 运行模式状态（顶层持有，传给 Run hook） ──
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -107,21 +121,55 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
   const [versionsSheetOpen, setVersionsSheetOpen] = useState(false);
   const [triggersSheetOpen, setTriggersSheetOpen] = useState(false);
   const [paramsDialogOpen, setParamsDialogOpen] = useState(false);
+  // 节点删除确认：与 popover 解耦，避免 popover outside-click 关闭时
+  // 把 ConfirmDialog 一起卸载（之前的版本点了 Trash 弹窗就闪没）
+  const [deleteConfirmNodeId, setDeleteConfirmNodeId] = useState<string | null>(null);
 
   // ── Popover 状态 ──
-  const [popoverOpen, setPopoverOpen] = useState(false);
+  const [nodeConfigSheetOpen, setNodeConfigSheetOpen] = useState(false);
   const [metaPopoverOpen, setMetaPopoverOpen] = useState(false);
+  const [filePopoverOpen, setFilePopoverOpen] = useState(false);
+  const [customTools, setCustomTools] = useState<CustomToolItem[]>([]);
+  const [publishConfirmOpen, setPublishConfirmOpen] = useState(false);
 
   // ── Refs ──
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pendingConnectSource = useRef<string | null>(null);
+  const pendingConnectHandleId = useRef<string | null>(null);
   const didConnect = useRef(false);
   const setDryRunResultRef = useRef<
     (result: { valid: boolean; issues: Array<{ type: string; message: string; field?: string }> } | null) => void
   >(() => {});
 
   // ── Meta Agent Chat ──
-  const { scenePrompt, chatOpen, setChatOpen, metaAgentId, agentList } = useWorkflowMetaAgent({ workflowId, meta });
+  const selectedNodeInfo = useMemo(() => {
+    if (!selectedNode) return null;
+    return { id: selectedNode.id, type: selectedNode.type ?? "unknown" };
+  }, [selectedNode?.id, selectedNode?.type, selectedNode]);
+
+  const { scenePrompt, contextKey, chatOpen, setChatOpen, metaAgentId, agentList } = useWorkflowMetaAgent({
+    workflowId,
+    meta,
+    selectedNodeInfo,
+  });
+
+  // 将当前编辑器上下文推入 Context Queue，每次消息发送时 agent 可感知
+  const editorContextText = useMemo(() => {
+    const lines = ["[Workflow Editor Context]"];
+    lines.push(`- ${t("editor.workflow_name")}: ${meta.name || t("editor.workflow_unnamed")}`);
+    if (selectedNodeInfo) {
+      lines.push(`- ${t("editor.selected_node")}: ${selectedNodeInfo.id} (type: ${selectedNodeInfo.type})`);
+    }
+    return lines.join("\n");
+  }, [meta.name, selectedNodeInfo, t]);
+
+  useContextQueue("workflow-editor-context", editorContextText);
+
+  // 运行完成后画布自动退出只读模式（runSnapshot 顶层已有，无需等 useWorkflowRun）
+  const isRunDone = runSnapshot?.dag_status
+    ? ["SUCCESS", "FAILED", "CANCELLED", "ERROR"].includes(runSnapshot.dag_status)
+    : false;
+  const forceReadOnly = activeRunId !== null && !isRunDone;
 
   // ── Persistence hook ──
   const {
@@ -151,7 +199,7 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
     setMeta,
     setDryRunResult: (r) => setDryRunResultRef.current(r),
     setYamlOpen,
-    readOnly: readOnly || activeRunId !== null,
+    readOnly: forceReadOnly || previewVersion !== null,
   });
 
   // ── Canvas hook ──
@@ -175,12 +223,13 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
     setEdges,
     setMeta,
     setSelectedNode,
-    readOnly: readOnly || activeRunId !== null,
+    readOnly: forceReadOnly || previewVersion !== null,
     activeRunId,
     selectedNode,
     screenToFlowPosition,
     fitView,
     pendingConnectSource,
+    pendingConnectHandleId,
     didConnect,
     setDryRunResult: (r) => setDryRunResultRef.current(r),
     setYamlText,
@@ -201,7 +250,6 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
     setDryRunResult,
     running,
     isRunMode,
-    isRunDone,
     dagStatus,
     runRightTab,
     setRunRightTab,
@@ -243,8 +291,38 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
     setDryRunResultRef.current = setDryRunResult;
   });
 
-  // ── 运行模式下画布自动只读 ──
-  const effectiveReadOnly = readOnly || isRunMode;
+  // 拉取已注册的 custom 工具，供 palette 和节点配置下拉使用
+  // 失败时静默退化（palette 不显示 custom 分区），不阻塞编辑器
+  useEffect(() => {
+    customToolsApi
+      .list()
+      .then(setCustomTools)
+      .catch((err) => {
+        console.error("Failed to load custom tools:", err);
+      });
+  }, []);
+
+  // Ctrl/Cmd+Shift+D 打印当前 Context Queue 到控制台（调试用）
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "D") {
+        e.preventDefault();
+        import("@/src/lib/context-queue").then(({ dumpContext }) => {
+          console.log("[Workflow CQ]", new Date().toLocaleTimeString(), dumpContext());
+        });
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
+  // 同步工具颜色到 WorkflowNode 的模块级缓存
+  useEffect(() => {
+    setToolColors(customTools);
+  }, [customTools]);
+
+  // ── 运行模式/版本预览下画布自动只读 ──
+  const effectiveReadOnly = (isRunMode && !isRunDone) || previewVersion !== null;
 
   // ── 保存状态 toast ──
   useEffect(() => {
@@ -267,20 +345,31 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
   }, [dryRunResult, t]);
 
   // ── Workflow SSE 实时事件 ──
+  // 用 ref 缓存 hasUnsavedChanges / previewVersion，避免它们出现在依赖数组中导致频繁断连重连。
+  // SSE 应该只在 workflowId 变化时重建；handler 内通过 ref 读取最新值即可。
+  const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
+  hasUnsavedChangesRef.current = hasUnsavedChanges;
+  const previewVersionRef = useRef(previewVersion);
+  previewVersionRef.current = previewVersion;
+  const handleRefreshDraftRef = useRef(handleRefreshDraft);
+  handleRefreshDraftRef.current = handleRefreshDraft;
+  const handleWorkflowEventRef = useRef(handleWorkflowEvent);
+  handleWorkflowEventRef.current = handleWorkflowEvent;
+
   useEffect(() => {
     if (!workflowId) return;
 
     connectWorkflowSSE(workflowId, (event) => {
       switch (event.type) {
         case "workflow.draft_updated":
-          if (!hasUnsavedChanges) {
-            handleRefreshDraft();
+          if (!hasUnsavedChangesRef.current && previewVersionRef.current === null) {
+            handleRefreshDraftRef.current();
           }
           break;
         case "workflow.run_started":
         case "workflow.run_status_changed":
         case "workflow.run_cancelled":
-          handleWorkflowEvent(event);
+          handleWorkflowEventRef.current(event);
           break;
         case "workflow.dry_run_completed":
         case "workflow.version_published":
@@ -289,9 +378,9 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
     });
 
     return () => {
-      disconnectWorkflowSSE();
+      disconnectWorkflowSSE(workflowId);
     };
-  }, [workflowId, handleRefreshDraft, handleWorkflowEvent, hasUnsavedChanges]);
+  }, [workflowId]);
 
   // ── Derived state ──
   const onSelectionChange: OnSelectionChangeFunc = canvasOnSelectionChange;
@@ -300,39 +389,56 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
   const handleNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node) => {
       if (isRunMode) {
+        // run mode 下运行情况显示在固定右侧栏（wf-run-panel），点击节点只需切换
+        // selectedRunNodeId，useWorkflowRun 会自动拉 getOutput 并切到 output 子 tab。
+        setSelectedRunNodeId(node.id);
         setSelectedNode(node);
         return;
       }
-      if (selectedNode?.id === node.id && popoverOpen) {
-        setPopoverOpen(false);
+      if (selectedNode?.id === node.id && nodeConfigSheetOpen) {
+        setNodeConfigSheetOpen(false);
         setSelectedNode(null);
       } else {
         setSelectedNode(node);
-        setPopoverOpen(true);
+        setNodeConfigSheetOpen(true);
       }
     },
-    [popoverOpen, selectedNode, isRunMode],
+    [nodeConfigSheetOpen, selectedNode, isRunMode],
   );
 
   // ── 画布移动时关闭 popover ──
   const handleMoveStart = useCallback(() => {
-    if (popoverOpen) {
-      setPopoverOpen(false);
+    if (nodeConfigSheetOpen) {
+      setNodeConfigSheetOpen(false);
       setSelectedNode(null);
     }
-  }, [popoverOpen]);
+  }, [nodeConfigSheetOpen]);
+
+  // ── 从 Sheet 删除当前选中节点 ──
+  // 与 ReactFlow 内置 deleteKeyCode 不同，这里是手动触发，需要同时清理 nodes、edges、Sheet 状态。
+  // 开始节点（START_NODE_ID）和只读模式下由 NodeConfigSheet 自身屏蔽，不进入此回调。
+  const handleDeleteNode = useCallback(
+    (nodeId: string) => {
+      setNodes((nds) => nds.filter((n) => n.id !== nodeId));
+      setEdges((eds) => eds.filter((e) => e.source !== nodeId && e.target !== nodeId));
+      setNodeConfigSheetOpen(false);
+      setSelectedNode(null);
+    },
+    [setNodes, setEdges],
+  );
 
   // 加载已保存的工作流草稿
   useEffect(() => {
     if (!workflowId) return;
     // workflowId 切换时清理所有旧状态
+    setPreviewVersion(null);
     setActiveRunId(null);
     setRunSnapshot(null);
     setRunEvents([]);
     setRunApprovals([]);
     setSelectedRunNodeId(null);
     setSelectedNodeOutput(null);
-    setPopoverOpen(false);
+    setNodeConfigSheetOpen(false);
     setSelectedNode(null);
     setYamlOpen(false);
     setRunSheetOpen(false);
@@ -340,9 +446,13 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
     setTriggersSheetOpen(false);
     (async () => {
       try {
-        const wf = await workflowDefApi.get(workflowId);
+        const wf = await unwrap(workflowDefApi.get(workflowId));
+        setWfData(wf);
         if (wf.draftYaml) {
           const { nodes: newNodes, edges: newEdges, meta: newMeta } = yamlToFlow(wf.draftYaml);
+          // 同步 node/edge 计数器，防止后续新增节点/边时 ID 与已有节点冲突
+          syncNodeCounter(newNodes.map((n) => n.id));
+          syncEdgeCounter(newEdges.map((e) => e.id));
           const laid = autoLayout(newNodes, newEdges);
           setNodes(laid);
           setEdges(newEdges);
@@ -354,9 +464,11 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
         if (wf.description) setMeta((m) => ({ ...m, description: String(wf.description ?? "") }));
       } catch (err) {
         console.error("Failed to load workflow:", err);
+        // 加载失败给用户明确反馈：否则用户面对空白画布会以为是新建状态
+        toast.error(t("editor.load_failed", { error: (err as Error).message }));
       }
     })();
-  }, [workflowId, fitView, setEdges, setNodes, setLastSavedYaml]);
+  }, [workflowId, fitView, setEdges, setNodes, setLastSavedYaml, t]);
 
   // Load historical run data (point-in-time replay)
   useEffect(() => {
@@ -373,8 +485,8 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
         setRunSheetOpen(true);
 
         const [snap, evts] = await Promise.all([
-          workflowEngineApi.getRunStatus(runId),
-          workflowEngineApi.getEvents(runId),
+          unwrap(workflowEngineApi.getRunStatus(runId)),
+          unwrap(workflowEngineApi.getEvents(runId)),
         ]);
         if (abort) return;
         if (snap) {
@@ -427,6 +539,57 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
     [handleRun],
   );
 
+  // ── 版本预览：切换到指定版本 ──
+  const handlePreviewVersion = useCallback(
+    async (version: number) => {
+      if (!workflowId) return;
+      try {
+        const result = await unwrap(workflowDefApi.getVersion(workflowId, version));
+        const { nodes: newNodes, edges: newEdges, meta: newMeta } = yamlToFlow(result.yaml);
+        const laid = autoLayout(newNodes, newEdges);
+        setNodes(laid);
+        setEdges(newEdges);
+        setMeta(newMeta);
+        setYamlText(result.yaml);
+        setYamlBaseText(result.yaml);
+        setPreviewVersion(version);
+        setSelectedNode(null);
+        setNodeConfigSheetOpen(false);
+        setTimeout(() => fitView({ padding: 0.15, duration: 300 }), 50);
+      } catch (err) {
+        console.error("Failed to preview version:", err);
+        toast.error(t("editor.load_failed"));
+      }
+    },
+    [workflowId, setNodes, setEdges, fitView, t],
+  );
+
+  // ── 版本预览：切回草稿 ──
+  const handleBackToDraft = useCallback(async () => {
+    if (!workflowId) return;
+    try {
+      const wf = await unwrap(workflowDefApi.get(workflowId));
+      setWfData(wf);
+      if (wf.draftYaml) {
+        const { nodes: newNodes, edges: newEdges, meta: newMeta } = yamlToFlow(wf.draftYaml);
+        syncNodeCounter(newNodes.map((n) => n.id));
+        syncEdgeCounter(newEdges.map((e) => e.id));
+        const laid = autoLayout(newNodes, newEdges);
+        setNodes(laid);
+        setEdges(newEdges);
+        setMeta(newMeta);
+        setLastSavedYaml(wf.draftYaml);
+      }
+      setPreviewVersion(null);
+      setSelectedNode(null);
+      setNodeConfigSheetOpen(false);
+      setTimeout(() => fitView({ padding: 0.15, duration: 300 }), 50);
+    } catch (err) {
+      console.error("Failed to load draft:", err);
+      toast.error(t("editor.load_failed"));
+    }
+  }, [workflowId, setNodes, setEdges, setLastSavedYaml, fitView, t]);
+
   return (
     <div className="flex w-full h-full bg-surface-0">
       <input
@@ -437,8 +600,25 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
         style={{ display: "none" }}
       />
 
+      {/* Meta Agent Chat 左侧面板 */}
+      <MetaAgentPanel
+        chatOpen={chatOpen}
+        setChatOpen={setChatOpen}
+        metaAgentId={metaAgentId}
+        scenePrompt={scenePrompt}
+        contextKey={contextKey}
+        onPromptComplete={handleRefreshDraft}
+      />
       <div className="flex-1 relative overflow-hidden">
-        {effectiveReadOnly && (
+        {previewVersion !== null && (
+          <div
+            className="wf-readonly-badge"
+            style={{ right: 12, borderColor: "#3b82f6", color: "#3b82f6", background: "rgba(239,246,255,0.9)" }}
+          >
+            {t("editor.vi_preview_mode")} v{previewVersion}
+          </div>
+        )}
+        {effectiveReadOnly && previewVersion === null && (
           <div className="wf-readonly-badge" style={{ right: 12 }}>
             <Lock size={12} /> {t("editor.readonly_mode")}
           </div>
@@ -451,7 +631,7 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
           onNodesDelete={(deleted) => {
             handleNodesDelete(deleted);
             if (selectedNode && deleted.some((n) => n.id === selectedNode.id)) {
-              setPopoverOpen(false);
+              setNodeConfigSheetOpen(false);
               setSelectedNode(null);
             }
           }}
@@ -468,7 +648,7 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
           nodesDraggable={!effectiveReadOnly}
           nodesConnectable={!effectiveReadOnly}
           elementsSelectable
-          deleteKeyCode={effectiveReadOnly ? null : "Delete"}
+          deleteKeyCode={effectiveReadOnly ? null : ["Delete", "Backspace"]}
           fitView
           fitViewOptions={{ padding: 0.15 }}
           defaultEdgeOptions={{ type: "logic" }}
@@ -506,6 +686,51 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
                 ))}
                 {/* 分隔线 */}
                 <div className="wf-palette-divider" />
+                {/* 自定义工具（仅当 registry 非空时显示） */}
+                {customTools.length > 0 && (
+                  <>
+                    <div className="wf-palette-group-title">{t("editor.palette_custom_tools")}</div>
+                    {customTools.map((tool) => (
+                      <button
+                        key={tool.name}
+                        type="button"
+                        className="wf-palette-btn"
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData("application/workflow-node", "custom");
+                          e.dataTransfer.setData("application/workflow-tool", tool.name);
+                          // 预填默认 outputs，避免 YAML 序列化时缺失 outputs 字段
+                          // 通配符工具（如 slurm）也预填 stdout 作为兜底默认输出
+                          e.dataTransfer.setData(
+                            "application/workflow-outputs",
+                            JSON.stringify(
+                              tool.produces.includes("*") || tool.produces.length === 0
+                                ? { stdout: { pattern: "", type: "value" } }
+                                : Object.fromEntries(tool.produces.map((k) => [k, { pattern: "", type: "value" }])),
+                            ),
+                          );
+                          e.dataTransfer.effectAllowed = "move";
+                        }}
+                        onClick={() => {
+                          // 为工具声明的 produces 生成默认 outputs
+                          // 通配符工具（如 slurm）也预填 stdout 作为兜底默认输出
+                          const defaultOutputs: Record<string, { pattern: string; type: string }> =
+                            tool.produces.includes("*") || tool.produces.length === 0
+                              ? { stdout: { pattern: "", type: "value" } }
+                              : Object.fromEntries(tool.produces.map((k) => [k, { pattern: "", type: "value" }]));
+                          addNode("custom", undefined, undefined, tool.name, defaultOutputs);
+                        }}
+                        title={tool.description}
+                      >
+                        <span className="wf-palette-icon" style={{ background: "#8b5cf6" }}>
+                          <Boxes size={14} />
+                        </span>
+                        {tool.name}
+                      </button>
+                    ))}
+                    <div className="wf-palette-divider" />
+                  </>
+                )}
                 {/* 数据变换预设 */}
                 {TRANSFORM_PRESETS.map((preset) => (
                   <button
@@ -546,39 +771,11 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
               <button
                 type="button"
                 className="wf-toolbar-btn"
-                onClick={() => fileInputRef.current?.click()}
-                data-tooltip={t("editor.tooltip_import")}
-              >
-                <Upload size={15} />
-              </button>
-              <button
-                type="button"
-                className="wf-toolbar-btn"
-                onClick={handleExportYaml}
-                data-tooltip={t("editor.tooltip_export")}
-              >
-                <Download size={15} />
-              </button>
-              <div className="wf-toolbar-divider" />
-              <button
-                type="button"
-                className="wf-toolbar-btn"
                 onClick={handleAutoLayout}
                 data-tooltip={t("editor.tooltip_layout")}
               >
                 <LayoutGrid size={15} />
               </button>
-              {workflowId && (
-                <button
-                  type="button"
-                  className="wf-toolbar-btn"
-                  onClick={handleRefreshDraft}
-                  disabled={isRunMode && !isRunDone}
-                  data-tooltip={t("editor.tooltip_refresh")}
-                >
-                  <RefreshCw size={15} />
-                </button>
-              )}
               {workflowId && (
                 <>
                   <div className="wf-toolbar-divider" />
@@ -586,7 +783,7 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
                     type="button"
                     className={`wf-toolbar-btn ${saveStatus === "unsaved" ? "text-amber-500" : ""}`}
                     onClick={handleSaveDraft}
-                    disabled={saveStatus === "saving"}
+                    disabled={saveStatus === "saving" || previewVersion !== null}
                     data-tooltip={
                       saveStatus === "saving"
                         ? t("editor.saving")
@@ -596,34 +793,6 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
                     }
                   >
                     {saveStatus === "saving" ? <RefreshCw size={15} className="animate-spin" /> : <Save size={15} />}
-                  </button>
-                  <button
-                    type="button"
-                    className={`wf-toolbar-btn ${versionsSheetOpen ? "active" : ""}`}
-                    onClick={() => {
-                      setVersionsSheetOpen(!versionsSheetOpen);
-                      if (!versionsSheetOpen) {
-                        setRunSheetOpen(false);
-                        setTriggersSheetOpen(false);
-                      }
-                    }}
-                    data-tooltip={t("editor.tooltip_versions")}
-                  >
-                    <Rocket size={15} />
-                  </button>
-                  <button
-                    type="button"
-                    className={`wf-toolbar-btn ${triggersSheetOpen ? "active" : ""}`}
-                    onClick={() => {
-                      setTriggersSheetOpen(!triggersSheetOpen);
-                      if (!triggersSheetOpen) {
-                        setRunSheetOpen(false);
-                        setVersionsSheetOpen(false);
-                      }
-                    }}
-                    data-tooltip={t("editor.tab_triggers")}
-                  >
-                    <Link size={15} />
                   </button>
                 </>
               )}
@@ -661,24 +830,6 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
               >
                 <Play size={15} />
               </button>
-              <div className="wf-toolbar-divider" />
-              <button
-                type="button"
-                className={`wf-toolbar-btn ${readOnly ? "active" : ""}`}
-                onClick={() => setReadOnly(!readOnly)}
-                data-tooltip={readOnly ? t("editor.tooltip_readonly_off") : t("editor.tooltip_readonly_on")}
-              >
-                {readOnly ? <Eye size={15} /> : <Edit3 size={15} />}
-              </button>
-              <div className="wf-toolbar-divider" />
-              <button
-                type="button"
-                className={`wf-toolbar-btn ${chatOpen ? "active" : ""}`}
-                onClick={() => setChatOpen(!chatOpen)}
-                data-tooltip={t("editor.tooltip_chat")}
-              >
-                <MessageSquare size={15} />
-              </button>
             </div>
           </Panel>
         </ReactFlow>
@@ -695,11 +846,11 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
           hasEdits={yamlOpen && yamlText !== yamlBaseText}
         />
 
-        {/* 节点配置 Popover */}
-        <NodeConfigPopover
-          open={popoverOpen}
+        {/* 节点配置 Sheet */}
+        <NodeConfigSheet
+          open={nodeConfigSheetOpen}
           onOpenChange={(open) => {
-            setPopoverOpen(open);
+            setNodeConfigSheetOpen(open);
             if (!open) setSelectedNode(null);
           }}
           selectedNode={selectedNode}
@@ -711,27 +862,21 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
           setSelectedNode={setSelectedNode}
           updateNodeData={updateNodeData}
           agentList={agentList}
-        />
-
-        {/* 工作流元数据 Popover（右下角齿轮） */}
-        <WorkflowMetaPopover
-          open={metaPopoverOpen}
-          onOpenChange={setMetaPopoverOpen}
-          readOnly={effectiveReadOnly}
+          onDeleteRequest={setDeleteConfirmNodeId}
           meta={meta}
           updateMeta={updateMeta}
+          customTools={customTools}
+          nodes={nodes}
+          workflowId={workflowId}
         />
 
-        {/* 运行日志 Popover（右下角，齿轮左侧） */}
-        <div className="wf-run-popover-anchor">
-          <Popover open={runSheetOpen} onOpenChange={setRunSheetOpen}>
+        {/* 右下角按钮组 */}
+        <div className="wf-bottom-actions">
+          {/* 文件操作菜单 */}
+          <Popover open={filePopoverOpen} onOpenChange={setFilePopoverOpen}>
             <PopoverTrigger asChild>
-              <button
-                type="button"
-                className={`wf-meta-trigger-btn ${runSheetOpen ? "active" : ""}`}
-                title={t("editor.tooltip_run_history")}
-              >
-                <List size={14} />
+              <button type="button" className="wf-meta-trigger-btn" title={t("editor.tooltip_file_menu")}>
+                <Upload size={14} />
               </button>
             </PopoverTrigger>
             <PopoverContent
@@ -740,47 +885,103 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
               sideOffset={8}
               collisionPadding={16}
               className="wf-meta-popover"
-              style={{ width: 360, maxHeight: 520 }}
+              style={{ width: 180 }}
             >
               <div className="wf-popover-header">
-                <span className="wf-popover-title">{t("editor.run_history")}</span>
+                <span className="wf-popover-title">{t("editor.file_menu_title")}</span>
               </div>
-              <RunStatusPanel
-                activeRunId={activeRunId}
-                runSnapshot={runSnapshot}
-                dagStatus={dagStatus}
-                isRunMode={isRunMode}
-                isRunDone={isRunDone}
-                running={running}
-                runEvents={runEvents}
-                runApprovals={runApprovals}
-                runRightTab={runRightTab}
-                setRunRightTab={setRunRightTab}
-                selectedRunNodeId={selectedRunNodeId}
-                setSelectedRunNodeId={setSelectedRunNodeId}
-                selectedNodeOutput={selectedNodeOutput}
-                nodeOutputLoading={nodeOutputLoading}
-                handleCancelRun={handleCancelRun}
-                handleBackToEdit={() => {
-                  handleBackToEdit();
-                  setRunSheetOpen(false);
-                }}
-                handleBackToList={() => {
-                  handleBackToList();
-                  setRunSheetOpen(false);
-                }}
-                handleApprove={handleApprove}
-                handleRerunFrom={handleRerunFrom}
-                setActiveRunId={setActiveRunId}
-                setRunSnapshot={setRunSnapshot}
-                setRunEvents={setRunEvents}
-                setRunApprovals={setRunApprovals}
-                setSelectedNodeOutput={setSelectedNodeOutput}
-                updateNodesFromSnapshot={updateNodesFromSnapshot}
-                setRightTab={() => setRunSheetOpen(false)}
-              />
+              <div className="flex flex-col gap-0.5 py-1">
+                <button
+                  type="button"
+                  className="wf-dropdown-item"
+                  onClick={() => {
+                    fileInputRef.current?.click();
+                    setFilePopoverOpen(false);
+                  }}
+                >
+                  <Upload size={14} />
+                  <span>{t("editor.import_yaml")}</span>
+                </button>
+                <button
+                  type="button"
+                  className="wf-dropdown-item"
+                  onClick={() => {
+                    handleExportYaml();
+                    setFilePopoverOpen(false);
+                  }}
+                >
+                  <Download size={14} />
+                  <span>{t("editor.export_yaml")}</span>
+                </button>
+              </div>
             </PopoverContent>
           </Popover>
+
+          {/* 工作流元数据 Popover（齿轮） */}
+          <WorkflowMetaPopover
+            open={metaPopoverOpen}
+            onOpenChange={setMetaPopoverOpen}
+            readOnly={effectiveReadOnly}
+            meta={meta}
+            updateMeta={updateMeta}
+          />
+
+          {/* 运行记录侧栏开关：原来用 Popover 浮窗，与 run mode 下的右侧栏重复。
+              统一为开关侧栏，运行状态/历史/事件/输出都在侧栏里。 */}
+          <button
+            type="button"
+            className={`wf-meta-trigger-btn ${runSheetOpen ? "active" : ""}`}
+            title={t("editor.tooltip_run_history")}
+            onClick={() => setRunSheetOpen((prev) => !prev)}
+          >
+            <List size={14} />
+          </button>
+
+          {/* 版本指示器 */}
+          <VersionIndicator
+            workflowId={workflowId}
+            latestVersion={wfData?.latestVersion ?? null}
+            previewVersion={previewVersion}
+            onPreview={handlePreviewVersion}
+            onBackToDraft={handleBackToDraft}
+            onViewAll={() => {
+              setVersionsSheetOpen(true);
+              setRunSheetOpen(false);
+              setTriggersSheetOpen(false);
+            }}
+          />
+
+          {/* 发布按钮：复用 handlePublish，ConfirmDialog 二次确认 */}
+          {workflowId && (
+            <button
+              type="button"
+              className="wf-meta-trigger-btn"
+              disabled={!workflowId || publishing || effectiveReadOnly}
+              title={t("editor.tooltip_publish")}
+              onClick={() => setPublishConfirmOpen(true)}
+              style={{
+                width: 32,
+                background: publishing ? "#d1d5db" : "#22c55e",
+                color: "#fff",
+                borderColor: publishing ? "#d1d5db" : "#22c55e",
+              }}
+            >
+              <Rocket size={14} />
+            </button>
+          )}
+
+          {/* 刷新草稿 */}
+          {workflowId && (
+            <button
+              type="button"
+              className="wf-meta-trigger-btn"
+              disabled={isRunMode && !isRunDone}
+              title={t("editor.tooltip_refresh")}
+              onClick={handleRefreshDraft}
+            >
+              <RefreshCw size={14} />
+            </button>
+          )}
         </div>
       </div>
 
@@ -813,15 +1014,6 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
         </SheetContent>
       </Sheet>
 
-      {/* Meta Agent Chat 侧边栏 */}
-      <MetaAgentPanel
-        chatOpen={chatOpen}
-        setChatOpen={setChatOpen}
-        metaAgentId={metaAgentId}
-        scenePrompt={scenePrompt}
-        onPromptComplete={handleRefreshDraft}
-      />
-
       {/* 运行参数输入对话框 */}
       {hasParams && (
         <RunParamsDialog
@@ -831,6 +1023,78 @@ function WorkflowEditorInner({ workflowId, runId }: WorkflowEditorProps) {
           params={workflowParams as any}
           onSubmit={onParamsSubmit}
         />
+      )}
+
+      {/* 节点删除确认：放在顶层（与 Popover/Sheet 同级），生命周期独立于
+          NodeConfigPopover，避免被 popover 的 outside-click 关闭连带卸载。 */}
+      <ConfirmDialog
+        open={deleteConfirmNodeId !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteConfirmNodeId(null);
+        }}
+        title={t("editor.delete_node_tooltip")}
+        description={t("editor.delete_node_confirm", { nodeId: deleteConfirmNodeId ?? "" })}
+        variant="destructive"
+        onConfirm={() => {
+          if (deleteConfirmNodeId) {
+            handleDeleteNode(deleteConfirmNodeId);
+          }
+          setDeleteConfirmNodeId(null);
+        }}
+      />
+
+      {/* 发布确认弹窗 */}
+      <ConfirmDialog
+        open={publishConfirmOpen}
+        onOpenChange={setPublishConfirmOpen}
+        title={t("editor.publish_confirm_title")}
+        description={t("editor.publish_confirm_desc", {
+          latest: wfData?.latestVersion ? `v${wfData.latestVersion}` : t("editor.no_published"),
+        })}
+        variant="default"
+        onConfirm={async () => {
+          setPublishConfirmOpen(false);
+          await handlePublish();
+        }}
+      />
+
+      {/* 运行记录侧栏：原 List 按钮触发的 Popover 已统一到这里。
+          - isRunMode=true 强制显示，避免运行情况被画布遮挡或弹到角落浮窗看不见
+          - 非 run mode 时由 List 按钮 toggle（runSheetOpen）控制，显示历史 run 列表 */}
+      {(runSheetOpen || isRunMode) && (
+        <aside className="wf-run-panel">
+          <RunStatusPanel
+            activeRunId={activeRunId}
+            runSnapshot={runSnapshot}
+            dagStatus={dagStatus}
+            isRunMode={isRunMode}
+            isRunDone={isRunDone}
+            running={running}
+            runEvents={runEvents}
+            runApprovals={runApprovals}
+            runRightTab={runRightTab}
+            setRunRightTab={setRunRightTab}
+            selectedRunNodeId={selectedRunNodeId}
+            setSelectedRunNodeId={setSelectedRunNodeId}
+            selectedNodeOutput={selectedNodeOutput}
+            nodeOutputLoading={nodeOutputLoading}
+            handleCancelRun={handleCancelRun}
+            handleBackToEdit={() => {
+              handleBackToEdit();
+              setRunSheetOpen(false);
+            }}
+            handleBackToList={handleBackToList}
+            handleApprove={handleApprove}
+            handleRerunFrom={handleRerunFrom}
+            setActiveRunId={setActiveRunId}
+            setRunSnapshot={setRunSnapshot}
+            setRunEvents={setRunEvents}
+            setRunApprovals={setRunApprovals}
+            setSelectedNodeOutput={setSelectedNodeOutput}
+            updateNodesFromSnapshot={updateNodesFromSnapshot}
+            setRightTab={() => setRunSheetOpen(false)}
+          />
+        </aside>
       )}
     </div>
   );

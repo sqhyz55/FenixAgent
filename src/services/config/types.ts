@@ -91,11 +91,11 @@ export type ProviderExtraOptions = Record<string, unknown>;
 
 /** Data shape accepted by upsertProvider */
 export interface ProviderUpsertData {
-  displayName?: string;
+  displayName?: string | null;
   protocol?: "openai" | "anthropic";
-  baseUrl?: string;
-  apiKey?: string;
-  extraOptions?: ProviderExtraOptions;
+  baseUrl?: string | null;
+  apiKey?: string | null;
+  extraOptions?: ProviderExtraOptions | null;
 }
 
 /** Additional options accepted by provider writes. */
@@ -322,3 +322,11 @@ export interface AgentConfigDetailWithAccess extends AgentConfigRowWithAccess {
   skillIds?: string[];
   mcpIds?: string[];
 }
+
+// ────────────────────────────────────────────
+// Engine Type
+// ────────────────────────────────────────────
+
+/** Supported engine type identifiers */
+export const ENGINE_TYPES = ["opencode", "ccb", "claude-code"] as const;
+export type EngineType = (typeof ENGINE_TYPES)[number];

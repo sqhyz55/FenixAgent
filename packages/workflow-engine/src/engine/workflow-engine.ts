@@ -11,6 +11,7 @@ import { AgentExecutor } from "../executor/agent-executor";
 import { ApiExecutor } from "../executor/api-executor";
 import type { PendingApproval } from "../executor/awaitable-executor";
 import { AuditExecutor, verifyApprovalToken } from "../executor/awaitable-executor";
+import { EndExecutor } from "../executor/end-executor";
 import { LoopExecutor } from "../executor/loop-executor";
 import { NodeExecutorRegistry } from "../executor/node-executor";
 import { ProcessExecutor } from "../executor/process-executor";
@@ -20,6 +21,7 @@ import { TransformExecutor } from "../executor/transform-executor";
 import type { ValidationIssue, ValidationResult } from "../parser/dag-validator";
 import { validateDAG } from "../parser/dag-validator";
 import { parseWorkflowYaml } from "../parser/yaml-parser";
+import { CustomNodeExecutor } from "../plugins/custom-executor";
 import { recoverRun } from "../recovery/snapshot-recovery";
 import { CancellationManager } from "../scheduler/cancellation";
 import type { DAGRunResult, SchedulerContext } from "../scheduler/dag-scheduler";
@@ -44,6 +46,8 @@ export interface WorkflowEngineOptions {
   envFile?: string;
   /** 默认工作目录（子流程 ref 解析基准） */
   defaultCwd?: string;
+  /** 自定义工具注册表（由服务启动时创建并注入） */
+  customRegistry?: import("../plugins/registry").CustomNodeRegistry;
 }
 
 /** dryRun 结果 */
@@ -136,14 +140,19 @@ export function createWorkflowEngine(options: WorkflowEngineOptions): WorkflowEn
     registry.register("audit", new AuditExecutor(hmacSecret));
     registry.register("workflow", new SubWorkflowExecutor(runId, registry, baseDir));
     registry.register("loop", new LoopExecutor(runId, registry));
+    registry.register("end", new EndExecutor());
     registry.register("transform", new TransformExecutor());
+    // 注册 custom executor（如果有 registry 注入）
+    if (options.customRegistry) {
+      registry.register("custom", new CustomNodeExecutor(options.customRegistry));
+    }
     return registry;
   }
 
   // ---------- 公开 API 实现 ----------
 
   function parse(yaml: string, baseDir?: string): WorkflowDef {
-    return parseWorkflowYaml(yaml, baseDir);
+    return parseWorkflowYaml(yaml, baseDir, { customRegistry: options.customRegistry });
   }
 
   function validate(def: WorkflowDef): ValidationResult {
@@ -221,9 +230,13 @@ export function createWorkflowEngine(options: WorkflowEngineOptions): WorkflowEn
       try {
         const scheduler = new DAGScheduler(context);
         result = await scheduler.run();
+        const ns = result.summary.node_summary;
+        console.log(
+          `[workflow] Run completed: runId=${runId} status=${result.status} nodes=${ns.total} completed=${ns.completed} failed=${ns.failed}`,
+        );
         return result;
       } catch (err) {
-        console.error(`[workflow-engine] runAsync ${runId} failed:`, err);
+        console.error(`[workflow] Run error: runId=${runId}`, err);
         throw err;
       } finally {
         if (result?.status !== "SUSPENDED") {

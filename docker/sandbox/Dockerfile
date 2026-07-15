@@ -1,36 +1,24 @@
-# ── Stage 1: 安装依赖 ──────────────────────────
-FROM oven/bun:1 AS deps
-WORKDIR /app
-COPY package.json bun.lock ./
-COPY packages ./packages
-RUN bun install --frozen-lockfile \
-    && rm -rf /root/.bun/install/cache /tmp/bun-*
-
-# ── Stage 2: 打包 start-remote-runtime ──────────
-FROM deps AS build
-COPY scripts/start-remote-runtime.ts ./scripts/start-remote-runtime.ts
-COPY tsconfig.json tsconfig.base.json ./
-# --target=node: 输出 Node.js 兼容的单文件 bundle
-# acp-link server.ts 内置 Bun/Node 运行时检测，client 模式（sandbox 场景）
-# 只用全局 WebSocket（Node 22 内置），不依赖 ws 库
-RUN bun build scripts/start-remote-runtime.ts --target=node --outdir /tmp/bundle
-
-# ── Stage 3: 最小运行时 ────────────────────────
+# ── Opencode Sandbox 运行时 (Node.js) ────────────────────────
 FROM node:22-bookworm-slim
-WORKDIR /app
+WORKDIR /app/workspaces
 
 ENV NODE_ENV=production
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ripgrep \
-    && rm -rf /var/lib/apt/lists/*
+# Opencode 运行需要的系统工具
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update
+RUN apt-get install -y --no-install-recommends \
+       python3 python3-pip python3-venv \
+       curl jq git ripgrep zip unzip
+RUN rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g opencode-ai@1.15.10 \
-    && rm -rf /root/.npm/_cacache
-
-COPY --from=build /tmp/bundle/start-remote-runtime.js ./
+# 安装 Opencode / ACP Runtime CLI / Hindsight 插件
+RUN npm install -g opencode-ai@1.17.12 @fenix-agent/acp-runtime-cli@0.3.0 @konghayao/opencode-hindsight@0.1.1
 
 RUN mkdir -p /app/workspaces
 VOLUME ["/app/workspaces"]
 
-CMD ["node", "start-remote-runtime.js", "opencode", "acp"]
+ENV AGENT_TYPE=opencode
+# acp-runtime 启动 opencode agent 并注册到 RCS
+CMD ["acp-runtime", "opencode", "acp"]

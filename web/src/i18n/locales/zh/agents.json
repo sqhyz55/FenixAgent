@@ -35,7 +35,8 @@
     "createConfirm": "创建",
     "tabs": {
       "basic": "基础",
-      "knowledge": "知识库"
+      "knowledge": "知识库",
+      "advanced": "高级配置"
     }
   },
   "templates": {
@@ -48,13 +49,15 @@
     "machine": "机器",
     "machinePlaceholder": "选择一个在线的机器",
     "machineLocal": "本地（默认）",
+    "engineType": "执行引擎",
+    "engineTypePlaceholder": "选择引擎类型",
     "machineValidationError": "机器为必选项",
     "model": "模型",
     "modelPlaceholder": "选择模型",
     "mode": "模式",
-    "steps": "步数 (1-200)",
+    "steps": "步数 (1-1000)",
     "stepsHint": "Agent 最大思考步骤数。建议：简单任务 10-30，复杂任务 50-100",
-    "stepsValidationError": "最大轮数须在 1-200 之间",
+    "stepsValidationError": "最大轮数须在 1-1000 之间",
     "prompt": "提示词 (Prompt)",
     "promptPlaceholder": "可选，自定义 Agent 提示词",
     "description": "描述",
@@ -72,7 +75,10 @@
     "hidden": "隐藏",
     "hiddenTitle": "不在 Agent 列表中显示，但仍可通过 API 调用",
     "disable": "禁用",
-    "disableTitle": "Agent 完全不可用，无法在界面或 API 中使用"
+    "disableTitle": "Agent 完全不可用，无法在界面或 API 中使用",
+    "extraLabel": "扩展配置 (JSON)",
+    "extraPlaceholder": "可选，JSON 格式的扩展配置，例如 {\"plugin\": {\"name\": \"...\"}}",
+    "extraValidationError": "扩展配置 JSON 格式无效"
   },
   "knowledge": {
     "bindTitle": "绑定知识库",
@@ -92,6 +98,12 @@
     "tabTitle": "绑定 MCP",
     "selectedCount": "已选择 {{count}} 个 MCP",
     "noOptions": "暂无可用 MCP"
+  },
+  "sites": {
+    "tabTitle": "绑定 Sites",
+    "selectedCount": "已选择 {{count}} 个 Site",
+    "noOptions": "暂无可用 Site — 请先在 Sites 页面创建",
+    "toggleList": "展开 / 收起 Site 列表"
   },
   "memory": {
     "enableTitle": "智能体记忆",
@@ -118,5 +130,16 @@
     "confirmDesc": "确定要删除Agent \"{{name}}\" 吗？",
     "success": "Agent已删除",
     "error": "删除失败: {{message}}"
-  }
+  },
+  "categories": {
+    "all": "全部",
+    "general": "通用助理",
+    "data": "数据分析",
+    "search": "搜索检索",
+    "monitor": "监控告警",
+    "code": "代码助手",
+    "custom": "自定义"
+  },
+  "loadFailed": "加载智能体失败",
+  "enterFailed": "进入智能体失败"
 }

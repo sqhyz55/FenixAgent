@@ -170,6 +170,26 @@ export async function getSkill(ctx: AuthContext, nameOrResourceKey: string): Pro
   const detail = await _deps.skillFs.readSkillDetailFromMd(contentPath);
 
   return {
+    id: meta.id,
+    name: meta.name,
+    description: meta.description ?? detail?.metadata.description ?? "",
+    content: detail?.content ?? "",
+    enabled: true,
+    path: contentPath,
+    metadata: stripNameAndDescription(detail?.metadata ?? {}),
+    resourceAccess: meta.resourceAccess,
+  };
+}
+
+export async function getSkillById(ctx: AuthContext, id: string): Promise<SkillDetail | null> {
+  const meta = await _deps.configPg.getSkillById(ctx, id);
+  if (!meta) return null;
+
+  const contentPath = skillContentPath(resolveSkillSourceOrganizationId(meta, ctx.organizationId), meta.name);
+  const detail = await _deps.skillFs.readSkillDetailFromMd(contentPath);
+
+  return {
+    id: meta.id,
     name: meta.name,
     description: meta.description ?? detail?.metadata.description ?? "",
     content: detail?.content ?? "",
@@ -267,6 +287,26 @@ export async function deleteSkill(ctx: AuthContext, name: string): Promise<boole
   return true;
 }
 
+export async function deleteSkillById(ctx: AuthContext, id: string): Promise<boolean> {
+  const meta = await _deps.configPg.getSkillById(ctx, id);
+  if (!meta) return false;
+  if (meta.resourceAccess?.writable === false) {
+    throw new AppError("External skill is read-only", "FORBIDDEN", 403);
+  }
+
+  const deleted = await _deps.configPg.deleteSkillById(ctx, id);
+  if (!deleted) return false;
+  const sourceOrganizationId = resolveSkillSourceOrganizationId(meta, ctx.organizationId);
+  const skillDir = skillSourceDir(sourceOrganizationId, meta.name);
+  await _deps.skillFs.deleteSkillDir(skillDir).catch((e) => {
+    logError(`[Skill] Failed to cleanup skill directory ${skillDir}:`, e);
+  });
+  await _deps.skillFs.deleteSkillArchive(getGlobalSkillsDir(), sourceOrganizationId, meta.name).catch((e) => {
+    logError(`[Skill] Failed to cleanup skill archive ${meta.name}:`, e);
+  });
+  return true;
+}
+
 /** 校验上传文件并检测冲突 */
 function validateImportFiles(files: UploadSkillFile[]): Map<string, UploadSkillFile[]> {
   if (files.length === 0) {
@@ -356,18 +396,20 @@ export async function importSkillDirectories(
   const targetDir = skillOrganizationDir(ctx.organizationId);
 
   // 并行检测冲突（N+1 → 单轮并行查询）
+  // 共享（external）的同名技能不视为冲突，允许上传创建当前组织自有 skill
   const entries = Array.from(grouped.entries());
   const existingResults = await Promise.all(
     entries.map(async ([name]) => {
       const existing = await _deps.configPg.getSkill(ctx, name);
-      return existing
-        ? {
-            name,
-            existing,
-            enabled: true,
-            path: skillContentPath(resolveSkillSourceOrganizationId(existing, ctx.organizationId), name),
-          }
-        : null;
+      if (!existing) return null;
+      // 外部共享的同名 skill 不算重复
+      if (existing.resourceAccess?.ownership === "external") return null;
+      return {
+        name,
+        existing,
+        enabled: true,
+        path: skillContentPath(resolveSkillSourceOrganizationId(existing, ctx.organizationId), name),
+      };
     }),
   );
   const existingConflicts = existingResults.filter(

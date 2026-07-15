@@ -1,76 +1,97 @@
 # 认证系统
 
-> 对应文件：`src/auth/`、`src/plugins/auth.ts`
+## 概述
 
-## 这个模块干什么
+认证系统是 FenixAgent 的信任边界——所有请求在抵达业务逻辑之前，必须通过认证系统确立调用者身份。
 
-认证系统负责回答一个问题："这个请求是谁发的？"
+FenixAgent 面向三种客户端场景提供服务，每种的安全约束和认证目标不同：
 
-RCS 有三种客户端，每种用不同的认证方式：
+| 客户端类型 | 运行环境 | 认证机制 | 凭证载体 | 认证目标 |
+|-----------|---------|---------|---------|---------|
+| 前端控制台 | 浏览器 | Session 认证 | Cookie | 建立用户身份 + 组织上下文 |
+| Agent 进程 / 外部 API | 服务端 / CLI | API Key | HTTP Header 或 URL Query | 建立用户身份 + 组织上下文 |
+| Machine（远端） | 服务端 | REGISTRY_SECRET | WebSocket URL Query | 验证机器接入合法性（不建立用户上下文） |
 
-| 客户端 | 认证方式 | 凭证形态 |
-|--------|----------|----------|
-| 前端 React 应用 | better-auth session | 浏览器 Cookie |
-| acp-link (Agent) | API Key | HTTP Header `Bearer rcs_xxx` 或 `?token=rcs_xxx` |
-| v2 Worker | JWT | HTTP Header `Bearer <jwt>` |
+**核心设计决策**：前两类认证完成后统一收敛为**认证上下文**（含组织 ID、用户 ID、角色），下游路由只需判断"此请求是否有权执行该操作"，无需关心"此请求以何种方式认证"。Machine 注册认证独立运作，仅验证机器身份，后续 relay 连接仍走前两种用户级认证。
 
-## 三个认证组件
+## 认证组件
 
-### 1. better-auth（`auth/better-auth.ts`）
+认证系统基于 [better-auth](https://www.better-auth.com) 构建，复用其 Session、Organization、API Key 等标准插件能力，在此之上封装多通道认证调度和组织上下文解析。
 
-标准的用户名密码认证。better-auth 是一个第三方库，RCS 使用它的 email/password 模式。
+### 1. Session 认证
 
-- 用户通过 `/api/auth/*` 注册和登录
-- 登录后浏览器获得一个 session cookie
-- 后续请求自动携带 cookie，服务端通过 `auth.api.getSession()` 校验
-- Session 有效期 7 天，每天自动续期
+标准的用户名密码认证。
 
-### 2. API Key Service（`auth/api-key-service.ts`）
+关键设计点：
+- Session 自动续期机制
+- 密码传输加密：认证中间件在路由层透明解密
+- 信任源动态构建：从多个来源（本地开发地址、部署地址、自定义配置）聚合为信任源列表，支持运行时动态扩展
 
-per-user 的 API Key，格式为 `rcs_` + 48 位 hex。每个用户可以创建多个 API Key，用于非浏览器的场景（acp-link 连接、API 调用）。
+### 2. API Key 认证
 
-关键操作：
-- **createApiKey**：生成 `rcs_xxx` 格式的 key，存入 `api_key` 表
-- **validateApiKeyAndGetUser**：通过 key 查用户，命中后异步更新 `lastUsedAt`
-- **listApiKeysByUser**：返回脱敏列表（只显示前 8 位 + 后 4 位）
-- **deleteApiKey**：删除指定 key
-- **validateLegacyApiKey**：校验 `RCS_API_KEYS` 环境变量中的全局 key（遗留）
+better-auth 的 API Key 插件提供标准的密钥认证：创建时绑定组织上下文，SHA-256 哈希存储，创建时返回明文（仅一次）。
 
-### 3. JWT（`auth/jwt.ts`）
+### 3. 机器注册认证
 
-遗留代码，仅用于 v2 Worker 协议的 token 生成和验证。使用 HS256 算法，密钥从 `RCS_JWT_SECRET` 环境变量读取。
+Machine 通过 WebSocket 连接到 `/acp/ws` 和 `/acp/file-ws` 时，使用 `REGISTRY_SECRET` 作为共享密钥进行认证：
 
-## authGuardPlugin（`plugins/auth.ts`）
-
-这是认证的核心调度器。它通过 Elysia 的 **macro** 机制，让路由声明式地选择认证方式。
-
-路由写法：
-
-```typescript
-app.post("/web/sessions", handler, { sessionAuth: true })   // cookie 认证
-app.post("/acp/ws", handler, { apiKeyAuth: true })           // API Key 认证
+```
+Machine → ws://<host>/acp/ws?secret=<REGISTRY_SECRET>
+服务端  → secret === process.env.REGISTRY_SECRET ? 放行 : 4003
 ```
 
-### apiKeyAuth 的认证优先级
+这是一个**全局共享密钥**，不绑定用户或组织。它的职责仅限于验证机器接入合法性——认证通过后建立 WS 通道，后续 relay 连接仍走 Session / API Key 用户级认证。
 
-当路由使用 `apiKeyAuth` 时，按以下顺序尝试：
+### 4. RCS_API_KEYS 全局密钥
 
-```text
-① environment secret 匹配
-   ↓ 不匹配
-② per-user API Key（api_key 表）
-   ↓ 不匹配
-③ legacy 全局 API Key（RCS_API_KEYS 环境变量）
-   ↓ 不匹配
-   返回 401
+服务端内部凭证，用逗号分隔多个密钥，当前唯一用途是为 Machine 签发 skill 下载令牌：
+
+- **Skill 下载令牌**：Machine 启动后从服务端下载 skill 内容时，服务端从 `RCS_API_KEYS` 中选取第一个密钥，对 payload 做 HMAC-SHA256 签名，生成 `{base64url(payload)}.{base64url(signature)}` 格式的一次性下载令牌
+
+与 API Key（`rcs_xxx`）不同，`RCS_API_KEYS` 不绑定用户或组织，属于服务端基础设施层面的信任凭证。它不是给外部客户端使用的认证入口，而是内部服务间通信的信任锚点。
+
+
+## 认证调度器
+
+这是认证的核心调度器。路由通过声明式机制选择认证方式，无需在 handler 内手写认证逻辑。
+
+### 两种认证方式
+
+| 认证方式 | 凭证来源 | 适用场景 |
+|-------|------|----------|
+| Session 认证 | session cookie | 控制面板 API |
+| API Key 认证 | HTTP Header 或 URL query token | Agent 侧通信、OpenAPI |
+
+### 多凭证支持
+
+Session 认证路由（`sessionAuth: true`）实际上接受两种凭证，决定先后尝试：
+
+1. 先检查 session cookie
+2. cookie 不存在或失效时，尝试 API Key
+
+```mermaid
+flowchart TD
+    REQ["请求到达"] --> COOKIE{"session cookie 有效?"}
+    COOKIE -->|是| CTX["构建认证上下文<br/>用户 + 组织ID + 角色"]
+    CTX --> PASS["放行"]
+    COOKIE -->|否| APIKEY["尝试 API Key 认证"]
+    APIKEY -->|成功| PASS2["放行"]
+    APIKEY -->|失败| NULL["拒绝（401）"]
 ```
 
-environment secret 优先级最高，这样 spawned instance 的 relay 连接可以直接用环境的 secret 完成认证，同时自动绑定到对应的环境记录。
+**设计意图**：同一套 `/web/*` 和 `/api/*` 路由同时支持浏览器（cookie）和 CLI 工具（API Key）两种客户端，无需维护两套认证入口。
 
-## 和其他模块的关系
+### 组织上下文解析
 
-- `better-auth.ts` → `db/`（存储用户和 session 到 PostgreSQL）
-- `api-key-service.ts` → `db/schema.ts`（`api_key` 表）
-- `plugins/auth.ts` → `auth/better-auth.ts`、`auth/api-key-service.ts`、`auth/jwt.ts`
-- `plugins/auth.ts` → `repositories/environment.ts`（environment secret 匹配）
-- 所有使用认证的路由 → `plugins/auth.ts` 的 macro
+认证完成后，认证上下文被注入到请求上下文，下游直接使用。上下文包含当前活跃组织 ID、用户 ID 和组织内角色。
+
+**组织上下文解析流程**：
+1. 从请求中提取活跃组织 ID（优先级：HTTP header → query param → cookie）
+2. 查询用户在该组织中的成员信息和角色
+3. 若未指定活跃组织，回退到用户的第一个组织
+4. 结果缓存
+
+在 API Key 认证路径中，从 API Key 的元数据中恢复组织信息，并通过二次校验确认成员关系仍然有效。
+
+
+

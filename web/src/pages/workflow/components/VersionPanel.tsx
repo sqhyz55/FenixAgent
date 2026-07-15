@@ -2,6 +2,8 @@ import { Inbox, Loader, Rocket, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/config/ConfirmDialog";
+import { unwrap } from "@/src/api/request";
 import { workflowDefApi } from "../../../api/workflow-defs";
 import { DAG_STATUS_CFG } from "../utils";
 
@@ -22,23 +24,32 @@ export function VersionPanel({
   const [viewingVersion, setViewingVersion] = useState<number | null>(null);
   const [viewingYaml, setViewingYaml] = useState<string | null>(null);
   const [publishingLocal, setPublishingLocal] = useState(false);
+  // 破坏性操作前必须二次确认（参考 VersionIndicator 同模式）
+  const [confirmAction, setConfirmAction] = useState<{
+    type: "setLatest" | "restore";
+    version: number;
+  } | null>(null);
   const { t } = useTranslation("workflows");
 
   const loadData = useCallback(async () => {
     if (!workflowId) return;
     setLoading(true);
-    try {
-      const [wfData, versionList] = await Promise.all([
-        workflowDefApi.get(workflowId),
-        workflowDefApi.getVersions(workflowId),
-      ]);
-      setWf(wfData);
-      setVersions(Array.isArray(versionList) ? versionList : []);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
+    // 独立加载 wf 和版本列表，某一项失败不影响另一项的展示
+    const [wfResult, versionsResult] = await Promise.allSettled([
+      unwrap(workflowDefApi.get(workflowId)),
+      unwrap(workflowDefApi.getVersions(workflowId)),
+    ]);
+    if (wfResult.status === "fulfilled") {
+      setWf(wfResult.value);
+    } else {
+      console.error("VersionPanel: 获取工作流详情失败", wfResult.reason);
     }
+    if (versionsResult.status === "fulfilled") {
+      setVersions(Array.isArray(versionsResult.value) ? versionsResult.value : []);
+    } else {
+      console.error("VersionPanel: 获取版本列表失败", versionsResult.reason);
+    }
+    setLoading(false);
   }, [workflowId]);
 
   useEffect(() => {
@@ -94,7 +105,7 @@ export function VersionPanel({
         return;
       }
       try {
-        const result = await workflowDefApi.getVersion(workflowId, version);
+        const result = await unwrap(workflowDefApi.getVersion(workflowId, version));
         setViewingVersion(version);
         setViewingYaml(result.yaml);
       } catch (err) {
@@ -251,7 +262,7 @@ export function VersionPanel({
                     {!isLatest && (
                       <button
                         type="button"
-                        onClick={() => handleSetLatest(v.version)}
+                        onClick={() => setConfirmAction({ type: "setLatest", version: v.version })}
                         style={{
                           padding: "2px 6px",
                           border: "1px solid #e5e7eb",
@@ -267,7 +278,7 @@ export function VersionPanel({
                     )}
                     <button
                       type="button"
-                      onClick={() => handleRestoreToDraft(v.version)}
+                      onClick={() => setConfirmAction({ type: "restore", version: v.version })}
                       style={{
                         padding: "2px 6px",
                         border: "1px solid #e5e7eb",
@@ -308,6 +319,27 @@ export function VersionPanel({
           })
         )}
       </div>
+
+      {/* 破坏性操作二次确认：参考 VersionIndicator 同模式 */}
+      <ConfirmDialog
+        open={confirmAction !== null}
+        onOpenChange={(o) => {
+          if (!o) setConfirmAction(null);
+        }}
+        title={confirmAction?.type === "setLatest" ? t("editor.vi_set_latest") : t("editor.vi_restore_to_draft")}
+        description={
+          confirmAction?.type === "restore"
+            ? t("editor.vi_restore_confirm", { version: confirmAction?.version ?? 0 })
+            : t("versions.set_latest_confirm", { version: confirmAction?.version ?? 0 })
+        }
+        variant={confirmAction?.type === "restore" ? "destructive" : "default"}
+        onConfirm={() => {
+          if (!confirmAction) return;
+          if (confirmAction.type === "setLatest") handleSetLatest(confirmAction.version);
+          else if (confirmAction.type === "restore") handleRestoreToDraft(confirmAction.version);
+          setConfirmAction(null);
+        }}
+      />
     </>
   );
 }

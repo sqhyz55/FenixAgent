@@ -10,7 +10,7 @@ import { cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import matter from "gray-matter";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 import type { ResourceAccess } from "./config/types";
 
 // ────────────────────────────────────────────
@@ -27,6 +27,7 @@ export interface SkillInfo {
 }
 
 export interface SkillDetail {
+  id?: string;
   name: string;
   description: string;
   content: string;
@@ -127,6 +128,16 @@ export function parseFrontmatter(raw: string): { metadata: Record<string, string
   return { metadata, content: parsed.content };
 }
 
+/** 将值格式化为安全的 YAML 标量值；包含换行时使用 `|` 块标量语法 */
+function yamlScalar(value: string): string {
+  if (!value.includes("\n")) return value;
+  const indented = value
+    .split("\n")
+    .map((line) => `  ${line}`)
+    .join("\n");
+  return `|\n${indented}`;
+}
+
 /** 构建 SKILL.md 文件内容（含 frontmatter） */
 export function buildSkillMd(
   name: string,
@@ -136,7 +147,7 @@ export function buildSkillMd(
 ): string {
   const meta: Record<string, string> = { name, description, ...(metadata ?? {}) };
   const frontmatter = Object.entries(meta)
-    .map(([k, v]) => `${k}: ${v}`)
+    .map(([k, v]) => `${k}: ${yamlScalar(v)}`)
     .join("\n");
   return `---\n${frontmatter}\n---\n${content}`;
 }
@@ -256,19 +267,24 @@ function createEndOfCentralDirectory(entryCount: number, centralSize: number, ce
   return end;
 }
 
-/** 生成仅使用 Store method 的 skill zip artifact。 */
-export async function buildSkillArchive(sourceDir: string, archivePath: string): Promise<void> {
+interface SkillArchiveBuildOptions {
+  rootDirectory?: string;
+}
+
+async function buildSkillArchiveBuffer(sourceDir: string, options?: SkillArchiveBuildOptions): Promise<Buffer> {
   const rootInfo = await stat(sourceDir);
   if (!rootInfo.isDirectory()) {
     throw createSkillValidationError("Skill 源目录不存在");
   }
 
+  const rootDirectory = options?.rootDirectory ? assertValidSkillName(options.rootDirectory) : null;
   const parts: Buffer[] = [];
   const centralParts: Buffer[] = [];
   let offset = 0;
 
   for (const filePath of await collectFiles(sourceDir)) {
-    const entryName = normalizeUploadPath(relative(sourceDir, filePath));
+    const relativePath = normalizeUploadPath(relative(sourceDir, filePath));
+    const entryName = rootDirectory ? `${rootDirectory}/${relativePath}` : relativePath;
     const nameBuffer = Buffer.from(entryName, "utf-8");
     const data = await readFile(filePath);
     const checksum = crc32(data);
@@ -280,15 +296,26 @@ export async function buildSkillArchive(sourceDir: string, archivePath: string):
 
   const centralOffset = offset;
   const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  return Buffer.concat([
+    ...parts,
+    ...centralParts,
+    createEndOfCentralDirectory(centralParts.length / 2, centralSize, centralOffset),
+  ]);
+}
+
+/** 生成仅使用 Store method 的 skill zip artifact。 */
+export async function buildSkillArchive(
+  sourceDir: string,
+  archivePath: string,
+  options?: SkillArchiveBuildOptions,
+): Promise<void> {
   await mkdir(dirname(archivePath), { recursive: true });
-  await writeFile(
-    archivePath,
-    Buffer.concat([
-      ...parts,
-      ...centralParts,
-      createEndOfCentralDirectory(centralParts.length / 2, centralSize, centralOffset),
-    ]),
-  );
+  await writeFile(archivePath, await buildSkillArchiveBuffer(sourceDir, options));
+}
+
+/** 生成 skill zip 内容，供不落盘的临时下载场景使用。 */
+export async function createSkillArchiveBuffer(sourceDir: string, options?: SkillArchiveBuildOptions): Promise<Buffer> {
+  return buildSkillArchiveBuffer(sourceDir, options);
 }
 
 // ────────────────────────────────────────────

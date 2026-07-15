@@ -44,11 +44,26 @@ export const ACP_METHOD = {
   SESSION_UPDATE: "session/update",
   SESSION_MODEL_CHANGED: "session/modelChanged",
   SESSION_MODE_CHANGED: "session/modeChanged",
+  SESSION_DELETE: "session/delete",
+  SESSION_RENAME: "session/rename",
   REQUEST_PERMISSION: "requestPermission",
 } as const;
 
 // 传输层消息类型（非 JSON-RPC）
-export const TRANSPORT_TYPES = ["connect", "disconnect", "status", "error", "ping", "pong", "keep_alive"] as const;
+export const TRANSPORT_TYPES = [
+  "connect",
+  "disconnect",
+  "status",
+  "error",
+  "ping",
+  "pong",
+  "keep_alive",
+  "control_response",
+  "permission_response",
+  "permission_request",
+  "interactive_question",
+  "cancel_pending_permissions",
+] as const;
 
 // ── 工具函数 ──────────────────────────
 

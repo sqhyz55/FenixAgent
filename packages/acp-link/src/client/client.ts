@@ -1,3 +1,4 @@
+import { extractModelState, extractModeState } from "../config-options-utils.js";
 import { ACP_METHOD, createRequest, createSuccessResponse, type JsonRpcRequest } from "../json-rpc.js";
 import type {
   ACPSettings,
@@ -6,12 +7,15 @@ import type {
   BrowserToolResult,
   ConnectionState,
   ContentBlock,
+  DeleteSessionRequest,
+  InteractiveQuestionPayload,
   ListSessionsRequest,
   ListSessionsResponse,
   LoadSessionRequest,
   PermissionRequestPayload,
   PromptCapabilities,
   PromptUsage,
+  RenameSessionRequest,
   ResumeSessionRequest,
   SessionModelState,
   SessionModeState,
@@ -38,6 +42,7 @@ export type SessionUpdateHandler = (sessionId: string, update: SessionUpdate) =>
 export type SessionCreatedHandler = (sessionId: string) => void;
 export type PromptCompleteHandler = (stopReason: string, usage?: PromptUsage) => void;
 export type PermissionRequestHandler = (request: PermissionRequestPayload) => void;
+export type InteractiveQuestionHandler = (question: InteractiveQuestionPayload) => void;
 export type BrowserToolCallHandler = (params: BrowserToolParams) => Promise<BrowserToolResult>;
 export type ErrorMessageHandler = (message: string) => void;
 export type ModelChangedHandler = (modelId: string) => void;
@@ -79,6 +84,7 @@ export class ACPClient {
   private sessionCreatedHandler: SessionCreatedHandler | null = null;
   private promptCompleteHandler: PromptCompleteHandler | null = null;
   private permissionRequestHandler: PermissionRequestHandler | null = null;
+  private interactiveQuestionHandler: InteractiveQuestionHandler | null = null;
   private browserToolCallHandler: BrowserToolCallHandler | null = null;
   private errorMessageHandler: ErrorMessageHandler | null = null;
   private authFailureHandler: (() => void) | null = null;
@@ -89,6 +95,46 @@ export class ACPClient {
   private availableCommandsChangedHandler: AvailableCommandsChangedHandler | null = null;
   private sessionLoadedHandler: SessionLoadedHandler | null = null;
   private sessionSwitchingHandler: SessionSwitchingHandler | null = null;
+
+  /**
+   * 兼容不同服务端返回形态，保证 session/load 和 session/resume 最终都能拿到 sessionId。
+   * 某些实现只返回字符串，或返回对象但不带 sessionId，这里统一回填到 state 初始化结构。
+   */
+  private normalizeSessionSwitchResult(
+    result: unknown,
+    requestedSessionId: string,
+  ): {
+    sessionId: string;
+    promptCapabilities?: PromptCapabilities;
+    models?: SessionModelState | null;
+    modes?: SessionModeState | null;
+  } {
+    if (typeof result === "string" && result.length > 0) {
+      return { sessionId: result };
+    }
+
+    if (typeof result === "object" && result !== null) {
+      const record = result as {
+        sessionId?: unknown;
+        promptCapabilities?: PromptCapabilities;
+        models?: SessionModelState | null;
+        modes?: SessionModeState | null;
+        configOptions?: Parameters<typeof extractModelState>[0];
+      };
+      const sessionId =
+        typeof record.sessionId === "string" && record.sessionId.length > 0 ? record.sessionId : requestedSessionId;
+
+      return {
+        sessionId,
+        promptCapabilities: record.promptCapabilities,
+        // SDK 0.28+ models/modes 字段可能已移除，回退到从 configOptions 提取
+        models: record.models ?? extractModelState(record.configOptions),
+        modes: record.modes ?? extractModeState(record.configOptions),
+      };
+    }
+
+    return { sessionId: requestedSessionId };
+  }
 
   constructor(settings: ACPSettings) {
     this.transport = new WSTransport();
@@ -145,7 +191,15 @@ export class ACPClient {
 
     // JSON-RPC 响应 → pending.tryResolve
     this.protocol.on("rpc_response", ({ id, result }) => {
-      this.pending.tryResolve(id, result);
+      const matched = this.pending.tryResolve(id, result);
+      // 页面刷新重连场景：disconnect 时 rejectAll 已清空 pending（包括 prompt 请求），
+      // agent 仍在运行，完成后发回的 prompt 响应到达时 tryResolve 返回 false。
+      // 此时若 result 含 stopReason（仅 prompt 响应有此字段），
+      // 仍需通知上层 promptCompleteHandler，避免 UI 永久 loading。
+      if (!matched && result && typeof result === "object" && "stopReason" in result) {
+        const typed = result as { stopReason: string; usage?: PromptUsage };
+        this.promptCompleteHandler?.(typed.stopReason, typed.usage);
+      }
     });
 
     // Protocol pong → heartbeat
@@ -166,6 +220,9 @@ export class ACPClient {
     });
     this.protocol.on("permission_request", (payload) => {
       this.permissionRequestHandler?.(payload);
+    });
+    this.protocol.on("interactive_question", (payload) => {
+      this.interactiveQuestionHandler?.(payload);
     });
     this.protocol.on("browser_tool_call", ({ callId, params }) => {
       this.handleBrowserToolCall(callId, params);
@@ -272,16 +329,27 @@ export class ACPClient {
     const req = createRequest(ACP_METHOD.SESSION_NEW, { cwd: sessionCwd, permissionMode });
     this.sendJsonRpcAndTrack(req, 30_000)
       .then((result) => {
-        const r = result as {
+        // JSON-RPC 错误响应（如 "Not connected to agent"）也会走 then 分支，需要显式检测
+        const r = result as Record<string, unknown>;
+        if (r?.error) {
+          const errDetail = (r.error as { code?: number; message?: string })?.message ?? JSON.stringify(r.error);
+          console.error("[ACPClient] createSession error response:", errDetail);
+          this.errorMessageHandler?.(errDetail);
+          return;
+        }
+        const typed = r as {
           sessionId: string;
           promptCapabilities?: PromptCapabilities;
           models?: SessionModelState | null;
           modes?: SessionModeState | null;
         };
-        this.state.initSession(r);
-        this.sessionCreatedHandler?.(r.sessionId);
+        this.state.initSession(typed);
+        this.sessionCreatedHandler?.(typed.sessionId);
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.error("[ACPClient] createSession failed:", (err as Error).message);
+        this.errorMessageHandler?.((err as Error).message);
+      });
   }
 
   sendPrompt(content: string | ContentBlock[]): void {
@@ -290,13 +358,25 @@ export class ACPClient {
     const req = createRequest(ACP_METHOD.SESSION_PROMPT, { content: blocks });
     this.sendJsonRpcAndTrack(req, 120_000)
       .then((result) => {
-        const r = result as { stopReason?: string; usage?: PromptUsage };
-        this.promptCompleteHandler?.(r.stopReason ?? "end_turn", r.usage);
+        // JSON-RPC 错误响应（如 "No active session"）也会走 then 分支，需要显式检测
+        const r = result as Record<string, unknown>;
+        if (r?.error) {
+          const errDetail = (r.error as { code?: number; message?: string })?.message ?? JSON.stringify(r.error);
+          console.error("[ACPClient] sendPrompt error response:", errDetail);
+          // 透传后端错误详情给前端展示，避免用户只看到模糊的"请求未能正常处理"
+          this.errorMessageHandler?.(errDetail);
+          this.promptCompleteHandler?.("error", { inputTokens: 0, outputTokens: 0 });
+          return;
+        }
+        const typed = r as { stopReason?: string; usage?: PromptUsage };
+        this.promptCompleteHandler?.(typed.stopReason ?? "end_turn", typed.usage);
       })
       .catch((err) => {
         console.error("[ACPClient] sendPrompt failed:", (err as Error).message);
-        // pending 超时或被 reject 时，也要通知上层结束 loading
-        this.promptCompleteHandler?.("error");
+        // 透传请求失败原因给前端展示，避免用户只看到模糊的"请求未能正常处理"
+        this.errorMessageHandler?.((err as Error).message);
+        // pending 超时或被 reject 时，传入 usage 零值标记，使上层能展示错误
+        this.promptCompleteHandler?.("error", { inputTokens: 0, outputTokens: 0 });
       });
   }
 
@@ -342,12 +422,7 @@ export class ACPClient {
     this.sessionSwitchingHandler?.(request.sessionId);
     const req = createRequest(ACP_METHOD.SESSION_LOAD, request);
     return this.sendJsonRpcAndWait<string>(req, 60_000).then((result) => {
-      const r = result as unknown as {
-        sessionId: string;
-        promptCapabilities?: PromptCapabilities;
-        models?: SessionModelState | null;
-        modes?: SessionModeState | null;
-      };
+      const r = this.normalizeSessionSwitchResult(result, request.sessionId);
       this.state.initSession(r);
       this.sessionLoadedHandler?.(r.sessionId);
       return r.sessionId;
@@ -361,16 +436,22 @@ export class ACPClient {
     this.sessionSwitchingHandler?.(request.sessionId);
     const req = createRequest(ACP_METHOD.SESSION_RESUME, request);
     return this.sendJsonRpcAndWait<string>(req, 30_000).then((result) => {
-      const r = result as unknown as {
-        sessionId: string;
-        promptCapabilities?: PromptCapabilities;
-        models?: SessionModelState | null;
-        modes?: SessionModeState | null;
-      };
+      const r = this.normalizeSessionSwitchResult(result, request.sessionId);
       this.state.initSession(r);
       this.sessionLoadedHandler?.(r.sessionId);
       return r.sessionId;
     });
+  }
+
+  deleteSession(request: DeleteSessionRequest): Promise<{ deleted: boolean; sessionId: string }> {
+    const req = createRequest(ACP_METHOD.SESSION_DELETE, request);
+    return this.sendJsonRpcAndWait<{ deleted: boolean; sessionId: string }>(req, 30_000);
+  }
+
+  renameSession(_request: RenameSessionRequest): void {
+    // ACP SDK 不支持 renameSession，此方法通过 REST API 完成。
+    // 前端应直接调用 PATCH /web/session/:id。
+    console.warn("[ACPClient] renameSession is not supported by ACP protocol; use REST API instead");
   }
 
   // ==========================================================================
@@ -441,6 +522,9 @@ export class ACPClient {
   }
   setPermissionRequestHandler(handler: PermissionRequestHandler | null): void {
     this.permissionRequestHandler = handler;
+  }
+  setInteractiveQuestionHandler(handler: InteractiveQuestionHandler | null): void {
+    this.interactiveQuestionHandler = handler;
   }
   setBrowserToolCallHandler(handler: BrowserToolCallHandler | null): void {
     this.browserToolCallHandler = handler;

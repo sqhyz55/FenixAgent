@@ -1,0 +1,67 @@
+/**
+ * SlurmNode 核心类型定义 — SlurmConfig, SshExecutor, JobResult。
+ */
+
+/** Slurm 作业资源声明 */
+export interface SlurmConfig {
+  /** Slurm 队列/分区名 */
+  partition: string;
+  /** CPU 核数（--cpus-per-task） */
+  cores: number;
+  /** 计算节点数，默认 1 */
+  nodes?: number;
+  /** 内存，如 "100G"。不设则用队列默认 */
+  memory?: string;
+  /** 最大运行时间，如 "04:00:00"。不设则用队列默认 */
+  walltime?: string;
+  /** module load 列表，如 ["apps/apptainer/1.2.4"] */
+  modules?: string[];
+  /** 作业名覆盖，默认使用 CustomNode.name */
+  jobName?: string;
+  /** 额外 #SBATCH 指令（如 --gres=gpu:1），原样追加 */
+  extraSBATCH?: string[];
+}
+
+/** SSH 执行器接口 — 生产用 BunSshExecutor，测试可注入 fake */
+export interface SshExecutor {
+  exec(
+    host: string,
+    command: string,
+    opts?: {
+      cwd?: string;
+      timeout?: number;
+    },
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }>;
+}
+
+/** sacct 轮询结果 */
+export interface JobResult {
+  /**
+   * 作业状态。终态：COMPLETED/FAILED/TIMEOUT/NODE_FAIL/OUT_OF_MEMORY/CANCELLED；
+   * 非终态：PENDING/RUNNING（mapSlurmState 返回 null 时由 pollJob 填入，
+   * 调用方据此决定继续轮询而非抛错）。
+   */
+  state: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "TIMEOUT" | "NODE_FAIL" | "OUT_OF_MEMORY" | "CANCELLED";
+  jobId: string;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  /**
+   * sacct 返回空数据标记（与 state === "PENDING" 但属不同语义）。
+   * slurmdbd 提交后 1-3 秒延迟，首次甚至前几次 sacct 拿不到数据正常；
+   * execute() 据此累加 noDataCount，达上限才判 FAILED，避免无限轮询。
+   */
+  sacctEmpty?: boolean;
+}
+
+/**
+ * Slurm 作业脚本声明 — YAML 中 script 字段的结构。
+ * 仅 SlurmNode 子类消费,由 yaml-parser.parseScriptConfig 解析、
+ * dag-scheduler 求值 ${{ }} 表达式后注入 ExecuteContext.script。
+ */
+export interface ScriptDef {
+  /** bash 脚本正文,支持 ${{ }} 表达式。不要写 #SBATCH 指令,header 由 generateHeader 生成 */
+  content: string;
+  /** 额外环境变量,注入到 #SBATCH --export。value 支持 ${{ }} 表达式 */
+  env?: Record<string, string>;
+}

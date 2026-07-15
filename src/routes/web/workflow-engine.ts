@@ -2,7 +2,6 @@
  * Workflow Engine API 路由。
  *
  * 通过 POST /web/workflow-engine + action 分发，提供工作流的执行、取消、审批、状态查询等能力。
- * listRuns 直接调用 StorageAdapter（不走引擎门面）。
  */
 
 import { createLogger } from "@fenix/logger";
@@ -12,13 +11,19 @@ import Elysia from "elysia";
 import { db } from "../../db";
 import { workflowSnapshot } from "../../db/schema";
 import { authGuardPlugin } from "../../plugins/auth";
+import { getVersionYaml, getWorkflowDef } from "../../repositories/workflow-def";
+import { WorkflowEngineActionRequestSchema, WorkflowEngineActionResponseSchema } from "../../schemas";
+import { WebErrSchema } from "../../schemas/common.schema";
 import { cleanupSpawnedEnvironments, getTeamEngine } from "../../services/workflow";
-import { createPgStorageAdapter } from "../../services/workflow/pg-storage-adapter";
+import { resolveYaml } from "../../services/workflow/resolve-yaml";
 import { publishWorkflowEvent } from "../../services/workflow/workflow-events";
 
 const logger = createLogger("wf-engine");
 
-const app = new Elysia({ name: "web-workflow-engine" }).use(authGuardPlugin);
+const app = new Elysia({ name: "web-workflow-engine" }).use(authGuardPlugin).model({
+  "workflow-engine-action-request": WorkflowEngineActionRequestSchema,
+  "workflow-engine-action-response": WorkflowEngineActionResponseSchema,
+});
 
 // POST /web/workflow-engine — action 分发
 app.post(
@@ -29,12 +34,19 @@ app.post(
     const payload = body as Record<string, unknown>;
     const action = payload.action as string;
     const engine = getTeamEngine(authCtx.organizationId);
+    const deps = { getWorkflowDef, getVersionYaml };
 
     try {
       switch (action) {
         // 执行工作流（异步启动，立即返回 runId）
         case "run": {
-          const yaml = payload.yaml as string;
+          const yaml = await resolveYaml(payload, authCtx.organizationId, deps);
+          if (!yaml) {
+            return error(400, {
+              success: false,
+              error: { code: "VALIDATION_ERROR", message: "yaml or workflowId is required" },
+            });
+          }
           const params = payload.params as Record<string, unknown> | undefined;
           const workflowId = payload.workflowId as string | undefined;
           const { runId, result } = engine.runAsync(yaml, params);
@@ -61,10 +73,16 @@ app.post(
                     dagStatus: r.status,
                   });
                 }
-              } finally {
-                // 清理本次运行启动的环境实例
-                if (r.spawnedEnvIds && r.spawnedEnvIds.length > 0) {
+              } catch (err) {
+                // 回写 workflowId 失败只记日志，不应阻塞后续清理
+                logger.error(`run background workflowId update failed: runId=${runId}`, err);
+              }
+              // 清理本次运行启动的环境实例（独立 try-catch，避免清理失败再次抛出未捕获 rejection）
+              if (r.spawnedEnvIds && r.spawnedEnvIds.length > 0) {
+                try {
                   await cleanupSpawnedEnvironments(new Set(r.spawnedEnvIds), authCtx.organizationId);
+                } catch (err) {
+                  logger.error(`run background cleanup failed: runId=${runId}`, err);
                 }
               }
             },
@@ -83,7 +101,13 @@ app.post(
 
         // 干运行：校验 + 展示执行计划
         case "dryRun": {
-          const yaml = payload.yaml as string;
+          const yaml = await resolveYaml(payload, authCtx.organizationId, deps);
+          if (!yaml) {
+            return error(400, {
+              success: false,
+              error: { code: "VALIDATION_ERROR", message: "yaml or workflowId is required" },
+            });
+          }
           const result = engine.dryRun(yaml);
           const dryRunWorkflowId = payload.workflowId as string | undefined;
           if (dryRunWorkflowId) {
@@ -107,7 +131,7 @@ app.post(
               dagStatus: "CANCELLED",
             });
           }
-          return { success: true };
+          return { success: true, data: null };
         }
 
         // 审批节点
@@ -124,7 +148,7 @@ app.post(
               dagStatus: "RUNNING",
             });
           }
-          return { success: true };
+          return { success: true, data: null };
         }
 
         // 获取运行状态快照
@@ -157,13 +181,6 @@ app.post(
           return { success: true, data: approvals };
         }
 
-        // 列出运行记录（直接调用 StorageAdapter）
-        case "listRuns": {
-          const storage = createPgStorageAdapter(authCtx.organizationId);
-          const runs = await storage.listRuns();
-          return { success: true, data: runs };
-        }
-
         // 从快照恢复运行
         case "recover": {
           const runId = payload.runId as string;
@@ -178,9 +195,6 @@ app.post(
           const fromNodeId = payload.fromNodeId as string;
           const yaml = payload.yaml as string;
           const workflowId = payload.workflowId as string | undefined;
-          if (workflowId) {
-            publishWorkflowEvent(workflowId, "workflow.run_started", { runId: undefined });
-          }
           const result = await engine.rerunFrom(prevRunId, yaml, fromNodeId);
           // 回写 workflowId 到新 run 的快照
           if (workflowId) {
@@ -193,6 +207,8 @@ app.post(
                   eq(workflowSnapshot.organizationId, authCtx.organizationId),
                 ),
               );
+            // 用真实 runId 发布事件，前端能正确响应
+            publishWorkflowEvent(workflowId, "workflow.run_started", { runId: result.runId });
           }
           if (workflowId && result.status) {
             const terminalStatuses = ["SUCCESS", "FAILED", "CANCELLED", "ERROR"];
@@ -207,20 +223,41 @@ app.post(
         }
 
         default:
-          return error(400, { error: { type: "validation_error", message: `Unknown action: ${action}` } });
+          return error(400, {
+            success: false,
+            error: { code: "validation_error", message: `Unknown action: ${action}` },
+          });
       }
     } catch (err: unknown) {
       // WorkflowError 带有 code，映射为对应 HTTP 状态码
       if (err instanceof WorkflowError) {
         const code = String(err.code);
         const status = code === "RUN_NOT_FOUND" ? 404 : code === "VALIDATION_ERROR" ? 400 : 500;
-        return error(status, { error: { type: code, message: err.message } });
+        return error(status, { success: false, error: { code: code, message: err.message } });
       }
       logger.error("Unexpected error:", err);
-      return error(500, { error: { type: "INTERNAL_ERROR", message: (err as Error).message || "Unknown error" } });
+      return error(500, {
+        success: false,
+        error: { code: "INTERNAL_ERROR", message: (err as Error).message || "Unknown error" },
+      });
     }
   },
-  { sessionAuth: true },
+  {
+    sessionAuth: true,
+    body: "workflow-engine-action-request",
+    response: {
+      200: "workflow-engine-action-response",
+      400: WebErrSchema,
+      404: WebErrSchema,
+      500: WebErrSchema,
+    },
+    detail: {
+      tags: ["Workflow Engine"],
+      summary: "工作流引擎控制",
+      description:
+        "通过 action 分发提供工作流执行、干运行、取消、审批、状态查询、事件读取、输出读取、恢复和重跑等引擎能力。",
+    },
+  },
 );
 
 export default app;

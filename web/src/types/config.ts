@@ -99,6 +99,8 @@ export interface McpLocalConfig {
   environment?: Record<string, string>;
   enabled?: boolean;
   timeout?: number;
+  /** 是否对其他组织公开可读 */
+  publicReadable?: boolean;
 }
 
 /** 远程 MCP 服务器配置（URL 连接） */
@@ -109,10 +111,21 @@ export interface McpRemoteConfig {
   headers?: Record<string, string>;
   oauth?: McpOAuthConfig | false;
   timeout?: number;
+  /** 是否对其他组织公开可读 */
+  publicReadable?: boolean;
+}
+
+/** Streamable HTTP MCP 服务器配置 */
+export interface McpStreamableHttpConfig {
+  type: "streamable-http";
+  url: string;
+  enabled?: boolean;
+  headers?: Record<string, string>;
+  timeout?: number;
 }
 
 /** MCP 服务器配置联合类型（含禁用变体） */
-export type McpServerConfig = McpLocalConfig | McpRemoteConfig | { enabled: false };
+export type McpServerConfig = McpLocalConfig | McpRemoteConfig | McpStreamableHttpConfig | { enabled: false };
 
 export interface OpenCodeConfig {
   $schema?: string;
@@ -158,7 +171,6 @@ export interface ProviderDetail {
   protocol: "openai" | "anthropic";
   keyHint: string | null;
   baseURL: string | null;
-  options: Record<string, unknown>;
   models: ProviderModel[];
   resourceAccess?: ResourceAccess;
   resourceKey?: string;
@@ -197,10 +209,11 @@ export interface AgentInfo {
   modelId: string | null;
   modelLabel?: string | null;
   description: string | null;
+  machineId?: string | null;
   knowledgeBaseCount: number;
   skillLabels?: Array<{ id: string; label: string }>;
+  engineType?: string | null;
   resourceAccess?: ResourceAccess;
-  enabled?: boolean;
 }
 
 export interface AgentDetail {
@@ -215,13 +228,16 @@ export interface AgentDetail {
   knowledge: AgentKnowledgeConfig | null;
   skillIds?: string[];
   mcpIds?: string[];
+  siteAppIds?: string[];
   machineId?: string | null;
+  engineType?: string | null;
   relatedResources?: {
     modelLabel?: string | null;
     machineLabel?: string | null;
     skills?: Array<{ id: string; label: string }>;
     mcps?: Array<{ id: string; label: string }>;
     knowledgeBases?: Array<{ id: string; label: string; slug?: string | null }>;
+    siteApps?: Array<{ id: string; label: string; remoteAppId: string | null }>;
   };
   resourceAccess?: ResourceAccess;
 }
@@ -240,17 +256,20 @@ export interface ResourceAccess {
 }
 
 export interface SkillInfo {
-  id: string;
+  id?: string;
   name: string;
+  enabled: boolean;
   description: string;
   path: string;
   resourceAccess?: ResourceAccess;
 }
 
 export interface SkillDetail {
+  id?: string;
   name: string;
   description: string;
   content: string;
+  enabled: boolean;
   path: string;
   metadata: Record<string, string>;
   resourceAccess?: ResourceAccess;
@@ -298,7 +317,7 @@ export interface SkillUploadConflictResponse {
 export interface McpServerInfo {
   id: string;
   name: string;
-  type: "local" | "remote" | "disabled";
+  type: "local" | "remote" | "streamable-http" | "disabled";
   enabled: boolean;
   summary: string;
   timeout?: number;
@@ -320,7 +339,7 @@ export interface McpToolInfo {
   id: string;
   toolName: string;
   description: string | null;
-  inputSchema: string | null;
+  inputSchema: Record<string, unknown> | null;
   inspectedAt: number;
 }
 

@@ -1,9 +1,12 @@
 import { z } from "zod/v4";
+import { DEFAULT_AGENT_SYSTEM_PROMPT } from "./services/agent-system-prompt";
+import { ENGINE_TYPES } from "./services/config/types";
 
 const envSchema = z.object({
   // ── 必填 ──
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
-  RCS_API_KEYS: z.string().min(1, "RCS_API_KEYS is required — used for acp-link / worker JWT signing"),
+  RCS_API_KEYS: z.string().min(1, "RCS_API_KEYS is required — used for skill download token HMAC signing"),
+  RCS_SYSTEM_API_KEYS: z.string().optional(),
 
   // ── 可选：服务器 ──
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
@@ -24,27 +27,14 @@ const envSchema = z.object({
   RCS_WS_IDLE_TIMEOUT: z.coerce.number().int().positive().default(255),
   RCS_WS_KEEPALIVE_INTERVAL: z.coerce.number().int().positive().default(20),
   RCS_DISCONNECT_TIMEOUT: z.coerce.number().int().positive().default(120),
-  RCS_JWT_EXPIRES_IN: z.coerce.number().int().positive().default(3600),
+  RCS_ACP_IDLE_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(1200),
+  RCS_ACP_IDLE_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().positive().default(300),
+  RCS_ACP_ACTIVITY_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(7200),
 
-  // ── 可选：知识库 ──
-  RCS_KNOWLEDGE_PROVIDER: z.string().default("openviking"),
-  RCS_KNOWLEDGE_BASE_URL: z.string().default("http://localhost:8090"),
-  RCS_KNOWLEDGE_API_KEY: z.string().default(""),
-  RCS_KNOWLEDGE_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
-
-  // ── 可选：S3 ──
-  RCS_S3_ENABLED: z
-    .string()
-    .default("false")
-    .transform((v) => v === "true"),
-  RCS_S3_ENDPOINT: z.string().default("http://localhost:9000"),
-  RCS_S3_REGION: z.string().default("us-east-1"),
-  RCS_S3_ACCESS_KEY: z.string().default(""),
-  RCS_S3_SECRET_KEY: z.string().default(""),
-  RCS_S3_BUCKET_SESSIONS: z.string().default("rcs-sessions"),
-  RCS_S3_BUCKET_ASSETS: z.string().default("rcs-assets"),
-  RCS_S3_PRESIGN_EXPIRES: z.coerce.number().int().positive().default(3600),
-  RCS_S3_PRESIGN_UPLOAD_EXPIRES: z.coerce.number().int().positive().default(600),
+  // ── 可选：知识库（RagFlow）──
+  RAGFLOW_API_URL: z.string().default("http://localhost:9380"),
+  RAGFLOW_API_KEY: z.string().default(""),
+  RAGFLOW_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
 
   // ── 可选：认证 ──
   RCS_DISABLE_SIGNUP: z
@@ -59,14 +49,37 @@ const envSchema = z.object({
   // ── 可选：Hindsight 记忆 MCP ──
   HINDSIGHT_MCP_URL: z.string().optional(),
 
+  // ── 可选：Agent Sites 代理 ──
+  AGENT_SITES_BASE_URL: z.string().optional(),
+  AGENT_SITES_MASTER_KEY: z.string().optional(),
+
+  // ── 可选：Agent 智能生成（使用标准 OpenAI 环境变量）──
+  // OPENAI_API_KEY 和 OPENAI_BASE_URL 由 OpenAI SDK 自动读取，此处仅声明模型名
+  OPENAI_MODEL: z.string().optional(),
+
   // ── 可选：Workflow ──
+  // 自定义节点（CustomNode）工具目录，启动时扫描 .ts 文件并实例化注册到 CustomNodeRegistry
+  WORKFLOW_TOOLS_DIR: z.string().default("./tools"),
 
   // ── 可选：注册中心 ──
   REGISTRY_SECRET: z.string().default("rcs-registry-secret"),
   ACPX_G_URL: z.string().default("http://localhost:8848"),
 
   // ── 可选：引擎 ──
-  RCS_ENGINE_TYPE: z.enum(["opencode", "ccb"]).default("opencode"),
+  // 默认 fallback 机器 ID。agent config 未绑定 machineId 时使用此机器替代 local-default
+  RCS_DEFAULT_MACHINE_ID: z
+    .string()
+    .regex(/^mach_/, "RCS_DEFAULT_MACHINE_ID must start with 'mach_'")
+    .optional(),
+
+  // 默认引擎类型。agent config 未指定 engineType 时覆盖硬编码默认值
+  RCS_DEFAULT_ENGINE_TYPE: z.enum(ENGINE_TYPES).optional(),
+  RCS_AGENT_SYSTEM_PROMPT: z.string().min(1).default(DEFAULT_AGENT_SYSTEM_PROMPT),
+  // 禁用 local-default 本地节点。设为 "true" 后所有实例必须路由到远程 machine
+  RCS_DISABLE_LOCAL_EXECUTION: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true"),
   RCS_CCB_COMMAND: z.string().default("ccb"),
   RCS_CCB_ARGS: z.string().default("--acp"),
 

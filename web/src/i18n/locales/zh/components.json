@@ -35,7 +35,9 @@
     "uploadFile": "上传文件",
     "noFiles": "暂无文件",
     "loadFailed": "加载文件失败",
-    "uploadFailed": "上传失败"
+    "uploadFailed": "上传失败",
+    "fileTooLarge": "{{name}} 太大了（上限 {{max}}）",
+    "uploadTooLarge": "上传失败：文件大小超过 100MB 限制"
   },
   "identity": {
     "title": "身份标识",
@@ -127,6 +129,86 @@
     "contextPlaceholder": "上下文 (placeholder), entries: {{count}}",
     "previewPlaceholder": "预览 (placeholder), entries: {{count}}"
   },
+  "panelMode": {
+    "files": "文件",
+    "sites": "站点",
+    "sitesTabAriaLabel": "站点选择栏",
+    "sitesEmptyTitle": "未绑定站点",
+    "sitesEmptyHint": "请在 Agent 配置中绑定 Site 后在此预览",
+    "pendingDiff": "文件区有 {{count}} 个新文件改动",
+    "mountSite": "挂载站点",
+    "mountSiteAriaLabel": "挂载站点",
+    "unmountSite": "卸载",
+    "unmountSiteAriaLabel": "卸载站点",
+    "mountDialogTitle": "挂载站点",
+    "mountDialogHint": "选择要挂载到此 Agent 的站点",
+    "mountDialogConfirm": "挂载 {{count}}",
+    "mountDialogConfirmNone": "挂载",
+    "noAvailableSites": "没有可挂载的站点",
+    "unmountConfirmTitle": "卸载站点？",
+    "unmountConfirm": "确定卸载此 Agent 的 \"{{name}}\" 站点？",
+    "mountSuccess": "已挂载 {{count}} 个站点",
+    "unmountSuccess": "已卸载站点",
+    "mountFailed": "挂载失败",
+    "unmountFailed": "卸载失败",
+    "tasks": "定时任务",
+    "tasksEmpty": "暂无绑定的定时任务",
+    "tasksManage": "前往管理",
+    "tasksCount": "共 {{count}} 个任务",
+    "tasksLoadFailed": "加载任务列表失败",
+    "tasksToggleFailed": "切换任务状态失败",
+    "tasksTriggerFailed": "触发任务失败",
+    "tasksListTitle": "任务列表",
+    "tasksViewLogs": "查看日志",
+    "views": "发布视图",
+    "viewsEmpty": "暂无发布的视图",
+    "viewsEmptyHint": "点击 + 创建发布视图",
+    "viewsManage": "前往管理",
+    "viewsLoadFailed": "加载发布视图失败",
+    "viewsToggleFailed": "切换视图状态失败",
+    "viewsListTitle": "发布视图",
+    "viewsCopyLink": "复制链接",
+    "viewsEdit": "编辑",
+    "viewsDelete": "删除",
+    "viewsLinkCopied": "链接已复制",
+    "viewsCopyFailed": "复制失败",
+    "viewsCreate": "创建",
+    "viewsCreateTitle": "创建发布视图",
+    "viewsEditTitle": "编辑发布视图",
+    "viewsDeleteTitle": "删除发布视图？",
+    "viewsDeleteConfirm": "确定删除 \"{{name}}\"？",
+    "viewsNameLabel": "名称",
+    "viewsNamePlaceholder": "输入视图名称",
+    "viewsDescLabel": "描述（可选）",
+    "viewsDescPlaceholder": "简要描述该视图的用途",
+    "viewsModulesLabel": "模块配置",
+    "viewsLinkLabel": "访问链接",
+    "viewsCreateSuccess": "创建成功",
+    "viewsUpdateSuccess": "更新成功",
+    "viewsDeleteSuccess": "删除成功",
+    "viewsSave": "保存",
+    "viewsCancel": "取消",
+    "viewsOpenView": "打开视图",
+    "viewsSuggestedNames": "推荐命名",
+    "viewsChatModules": "Chat 模块",
+    "viewsPanelModules": "附加面板",
+    "viewsEnabled": "已启用",
+    "viewsDisabled": "已禁用"
+  },
+  "siteFrame": {
+    "share": "分享",
+    "reload": "刷新站点",
+    "openInNewTab": "在新标签页打开",
+    "loading": "加载站点中...",
+    "loadingSites": "加载 Agent 绑定的站点...",
+    "loadFailed": "加载站点失败：{{message}}",
+    "loadTimeout": "站点加载超时",
+    "loadTimeoutHint": "站点可能在后台继续加载，可刷新重试或在新标签页打开",
+    "traceToCreator": "溯源",
+    "traceToCreatorTooltip": "切换到创建此站点的智能体",
+    "notCreator": "非创建者智能体",
+    "notCreatorTooltip": "此站点由其他智能体创建，你只能操作数据，无法修改站点文件。点击溯源切换到创建者智能体。"
+  },
   "fileTree": {
     "refresh": "刷新",
     "emptyState": "工作区暂无文件",
@@ -147,6 +229,11 @@
     "uploadingProgress": "{{percent}}%",
     "downloadZip": "下载 ZIP",
     "downloadFailed": "下载失败",
+    "showTree": "展开文件树",
+    "hideTree": "收起文件树",
+    "closeTab": "关闭标签",
+    "moreTabs": "还有 {{count}} 个标签",
+    "noTabsHint": "从左侧文件树选择文件预览",
     "contextMenu": {
       "reference": "引用到聊天",
       "rename": "重命名",
@@ -167,7 +254,9 @@
       "pdfLoadFailed": "加载 PDF 失败",
       "tableLoadFailed": "加载表格文件失败",
       "emptyTable": "表格为空",
-      "tableTruncated": "显示 {{shown}} / {{total}} 行"
+      "tableTruncated": "显示 {{shown}} / {{total}} 行",
+      "htmlPreview": "预览",
+      "htmlSource": "源码"
     }
   },
   "tool": {
@@ -221,24 +310,36 @@
     "submit": "提交"
   },
   "chatView": {
+    "startConversation": "开始对话",
+    "startConversationDesc": "输入消息开始聊天",
     "thinking": "思考中"
   },
   "commandMenu": {
-    "noMatch": "没有匹配的命令"
+    "noMatch": "没有匹配的命令",
+    "searchPlaceholder": "搜索技能..."
   },
   "messageBubble": {
     "expand": "展开",
     "uploadedImage": "已上传图片"
   },
   "planView": {
+    "high": "高",
+    "medium": "中",
+    "low": "低",
     "executionPlan": "执行计划"
   },
   "sessionSidebar": {
+    "today": "今天",
+    "yesterday": "昨天",
+    "earlier": "更早",
+    "header": "会话",
     "sessions": "会话",
     "historySessions": "历史会话",
     "noSessions": "暂无会话"
   },
   "toolCallGroup": {
+    "running": "运行中",
+    "failed": "{{count}} 失败",
     "input": "输入",
     "output": "输出"
   },
@@ -268,19 +369,38 @@
     "sessions": "会话",
     "today": "今天",
     "yesterday": "昨天",
-    "earlier": "更早"
+    "earlier": "更早",
+    "rename": "重命名",
+    "delete": "删除",
+    "closeToPopover": "收起至弹窗"
   },
   "chatInterface": {
+    "processingError": "请求未能正常处理，请检查 Agent 或大模型状态后重试",
+    "processingErrorDetail": "请求未能正常处理 (stopReason: {{stopReason}}, inputTokens: {{inputTokens}}, outputTokens: {{outputTokens}})，请检查 Agent 或大模型状态后重试",
     "newThread": "新对话",
     "agentPlaceholder": "给智能体发送消息…",
     "waitingSession": "等待会话...",
     "readonlyMode": "只读模式 — 无法发送消息"
+  },
+  "chatHeader": {
+    "newSession": "新会话",
+    "searchPlaceholder": "搜索历史会话…",
+    "noResults": "没有匹配的会话",
+    "refresh": "刷新会话列表",
+    "showSessions": "展开会话面板",
+    "hideSessions": "收起会话面板",
+    "pinSessions": "钉住会话面板",
+    "unpinSessions": "解除钉住"
   },
   "chatMessage": {
     "you": "你",
     "agent": "智能体"
   },
   "contextPanel": {
+    "unknownModel": "未知",
+    "input": "输入",
+    "output": "输出",
+    "defaultSession": "默认",
     "showContext": "显示上下文面板",
     "hideContext": "隐藏上下文面板",
     "running": "运行中",
@@ -300,6 +420,7 @@
     "empty": "暂无内容"
   },
   "todoPanel": {
+    "collapse": "收起",
     "completed": "已完成",
     "inProgress": "进行中"
   },
@@ -314,11 +435,90 @@
   "metaAgent": {
     "title": "Meta Agent",
     "history_title": "会话历史",
-    "history_today": "今天",
-    "history_yesterday": "昨天",
-    "history_earlier": "更早",
     "history_empty": "暂无会话",
     "history_untitled": "未命名",
-    "chat_collapse": "收起面板"
+    "chat_collapse": "收起面板",
+    "chat_expand": "展开面板"
+  },
+  "chatComposer": {
+    "send": "发送",
+    "stop": "停止",
+    "newSession": "新会话",
+    "hint": "Enter 发送，Shift+Enter 换行 · 粘贴图片或输入 @ 引用文件",
+    "skillButton": "技能",
+    "fileButton": "文件",
+    "uploadingFiles": "正在上传 {{count}} 个文件…"
+  },
+  "chatEmpty": {
+    "startConversation": "开始对话",
+    "startConversationDesc": "输入消息开始与 ACP agent 聊天",
+    "skills": "已加载 Skills",
+    "skillsHint": "输入 / 打开 Skill 弹窗",
+    "noSkills": "暂无绑定 Skills"
+  },
+  "agentBadge": {
+    "enterChat": "进入对话",
+    "edit": "编辑",
+    "statusRunning": "运行中",
+    "statusStopped": "已停止"
+  },
+  "orgSwitchFailed": "切换组织失败",
+  "imagePreview": {
+    "zoomIn": "放大",
+    "zoomOut": "缩小",
+    "reset": "还原"
+  },
+  "hindsightToolCard": {
+    "failed": "失败"
+  },
+  "statusBadge": {
+    "configured": "已配置",
+    "enabled": "已启用",
+    "unconfigured": "未配置",
+    "disabled": "已禁用",
+    "builtin": "内置",
+    "custom": "自定义",
+    "primaryModel": "主模型",
+    "subAgent": "子Agent",
+    "all": "全部"
+  },
+  "dataTable": {
+    "actions": "操作",
+    "noData": "暂无数据",
+    "searchPlaceholder": "搜索...",
+    "pagination": "第 {{start}}-{{end}} 条，共 {{total}} 条"
+  },
+  "confirmDialog": {
+    "confirm": "确认",
+    "cancel": "取消",
+    "processing": "处理中..."
+  },
+  "formDialog": {
+    "save": "保存",
+    "cancel": "取消",
+    "saving": "保存中..."
+  },
+  "batchActionBar": {
+    "selected": "已选择 {{count}} 项",
+    "clear": "清除"
+  },
+  "datePicker": {
+    "placeholder": "选择日期"
+  },
+  "toolCallRow": {
+    "viewParams": "查看参数",
+    "previewFile": "预览 {{path}}",
+    "openFile": "打开文件",
+    "toolName": "工具"
+  },
+  "permissionPanel": {
+    "allow": "允许",
+    "deny": "拒绝"
+  },
+  "sessionModeSelector": {
+    "default": "默认"
+  },
+  "modelIconMap": {
+    "qwen": "Qwen / 通义千问"
   }
 }

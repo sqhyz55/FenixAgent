@@ -37,11 +37,18 @@ export interface KnowledgeResourceContent {
 
 export interface KnowledgeProvider {
   createKnowledgeBase(input: {
+    organizationId: string;
     userId: string;
     slug: string;
     name: string;
     description?: string;
   }): Promise<KnowledgeBaseSnapshot>;
+  /** 删除整个知识库；RagFlow 不同版本可能使用单资源路径或集合端点。 */
+  deleteKnowledgeBase(input: {
+    knowledgeBaseRemoteId: string;
+    remoteAccountId: string;
+    remoteUserId: string;
+  }): Promise<void>;
   addResource(input: {
     knowledgeBaseRemoteId?: string | null;
     targetRemoteId?: string | null;
@@ -59,6 +66,7 @@ export interface KnowledgeProvider {
   }): Promise<KnowledgeResourceSnapshot[]>;
   deleteResource(input: {
     resourceRemoteId: string;
+    knowledgeBaseRemoteId: string;
     remoteAccountId: string;
     remoteUserId: string;
     recursive?: boolean;
@@ -74,6 +82,7 @@ export interface KnowledgeProvider {
   }): Promise<KnowledgeSearchResult[]>;
   readResource(input: {
     resourceRemoteId: string;
+    knowledgeBaseRemoteId: string;
     remoteAccountId: string;
     remoteUserId: string;
   }): Promise<KnowledgeResourceContent>;

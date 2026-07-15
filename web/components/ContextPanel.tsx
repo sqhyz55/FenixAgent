@@ -1,6 +1,7 @@
 import { PanelRight, PanelRightClose } from "lucide-react";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import type { PromptUsage } from "../src/acp/types";
 import type { ThreadEntry, ToolCallEntry } from "../src/lib/types";
 import { cn } from "../src/lib/utils";
 
@@ -15,12 +16,29 @@ interface ContextPanelProps {
   duration?: string;
   collapsed: boolean;
   onToggle: () => void;
+  /** ACP 真实 token 用量（prompt/complete 响应），存在时优先于客户端估算展示 */
+  acpUsage?: PromptUsage | null;
 }
 
-export function ContextPanel({ entries, agentName, modelName, duration, collapsed, onToggle }: ContextPanelProps) {
+export function ContextPanel({
+  entries,
+  agentName,
+  modelName,
+  duration,
+  collapsed,
+  onToggle,
+  acpUsage,
+}: ContextPanelProps) {
   const { t } = useTranslation("components");
   const stats = useMemo(() => computeStats(entries), [entries]);
-  const displayAgentName = useMemo(() => simplifyDisplayName(agentName), [agentName]);
+  const displayAgentName = useMemo(() => simplifyDisplayName(agentName, t), [agentName, t]);
+
+  // ACP 真实 token 用量优先，没有时回退到客户端估算
+  const hasAcpUsage =
+    acpUsage && (acpUsage.totalTokens != null || acpUsage.inputTokens != null || acpUsage.outputTokens != null);
+  const displayTokens = hasAcpUsage ? (acpUsage!.totalTokens ?? 0) : stats.estimatedTokens;
+  const displayInputTokens = hasAcpUsage ? (acpUsage!.inputTokens ?? 0) : stats.estimatedInputTokens;
+  const displayOutputTokens = hasAcpUsage ? (acpUsage!.outputTokens ?? 0) : stats.estimatedOutputTokens;
 
   return (
     <div className="relative flex shrink-0">
@@ -64,7 +82,9 @@ export function ContextPanel({ entries, agentName, modelName, duration, collapse
               <div className="text-[13px] font-semibold text-text-primary overflow-hidden text-ellipsis whitespace-nowrap">
                 {displayAgentName}
               </div>
-              <div className="text-[11px] text-text-muted mt-px font-mono">{modelName || "未知"}</div>
+              <div className="text-[11px] text-text-muted mt-px font-mono">
+                {modelName || t("contextPanel.unknownModel")}
+              </div>
             </div>
           </div>
           <div className="flex items-center gap-1.5 mt-2">
@@ -82,7 +102,7 @@ export function ContextPanel({ entries, agentName, modelName, duration, collapse
         {/* Stats row */}
         <div className="grid grid-cols-3 border-b border-border">
           <div className="px-3 py-2.5 text-center border-r border-border">
-            <div className="text-sm font-bold font-mono text-brand">{formatTokenCount(stats.estimatedTokens)}</div>
+            <div className="text-sm font-bold font-mono text-brand">{formatTokenCount(displayTokens)}</div>
             <div className="text-[9px] font-semibold uppercase tracking-[0.06em] text-text-muted mt-0.5">
               {t("contextPanel.tokens")}
             </div>
@@ -106,17 +126,17 @@ export function ContextPanel({ entries, agentName, modelName, duration, collapse
           <div className="flex justify-between items-center mb-2">
             <span className="text-[11px] font-semibold text-text-secondary">{t("contextPanel.tokenUsage")}</span>
             <span className="text-[11px] font-mono text-text-primary font-semibold">
-              {formatTokenCount(stats.estimatedTokens)} / 200k
+              {formatTokenCount(displayTokens)} / 200k
             </span>
           </div>
           <div className="h-1 rounded-sm bg-surface-3 overflow-hidden flex">
             <div
               className="h-full bg-brand transition-[width] duration-500 ease"
-              style={{ width: `${Math.min(stats.estimatedInputTokens / 2000, 50)}%` }}
+              style={{ width: `${Math.min(displayInputTokens / 2000, 50)}%` }}
             />
             <div
               className="h-full bg-accent-green transition-[width] duration-500 ease"
-              style={{ width: `${Math.min(stats.estimatedOutputTokens / 2000, 50)}%` }}
+              style={{ width: `${Math.min(displayOutputTokens / 2000, 50)}%` }}
             />
           </div>
           <div className="flex gap-3 mt-1.5">
@@ -125,9 +145,9 @@ export function ContextPanel({ entries, agentName, modelName, duration, collapse
                 className="w-[5px] h-[5px] rounded-full inline-block"
                 style={{ background: "var(--color-brand)" }}
               />
-              输入{" "}
+              {t("contextPanel.input")}{" "}
               <span className="font-mono font-semibold text-text-secondary">
-                {formatTokenCount(stats.estimatedInputTokens)}
+                {formatTokenCount(displayInputTokens)}
               </span>
             </span>
             <span className="text-[10px] text-text-muted flex items-center gap-1">
@@ -135,9 +155,9 @@ export function ContextPanel({ entries, agentName, modelName, duration, collapse
                 className="w-[5px] h-[5px] rounded-full inline-block"
                 style={{ background: "var(--color-accent-green)" }}
               />
-              输出{" "}
+              {t("contextPanel.output")}{" "}
               <span className="font-mono font-semibold text-text-secondary">
-                {formatTokenCount(stats.estimatedOutputTokens)}
+                {formatTokenCount(displayOutputTokens)}
               </span>
             </span>
           </div>
@@ -269,8 +289,8 @@ function computeStats(entries: ThreadEntry[]) {
   };
 }
 
-function simplifyDisplayName(name?: string): string {
-  if (!name) return "默认";
+function simplifyDisplayName(name?: string, t?: (key: string) => string): string {
+  if (!name) return t?.("contextPanel.defaultSession") ?? "默认";
   if (name.startsWith("env_")) return name.length > 16 ? `${name.slice(0, 16)}…` : name;
   if (name.length > 20) return `${name.slice(0, 18)}…`;
   return name;

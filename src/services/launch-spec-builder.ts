@@ -3,12 +3,14 @@ import { join } from "node:path";
 import { log, error as logError } from "@fenix/logger";
 import type { AgentLaunchSpec, McpServerConfig, ModelConfig } from "@fenix/plugin-sdk";
 import { and, asc, eq, inArray } from "drizzle-orm";
-import { getBaseUrl } from "../config";
+import { config, getBaseUrl } from "../config";
 import { db } from "../db";
-import { agentConfigMcp, agentConfigSkill, mcpServer, model, provider, skill } from "../db/schema";
+import { agentConfigMcp, agentConfigSkill, mcpServer, member, model, provider, skill } from "../db/schema";
 import { AppError } from "../errors";
 import { listAgentKnowledgeBindingsById } from "./agent-knowledge";
+import { composeAgentSystemPrompt } from "./agent-system-prompt";
 import type { AgentConfigDetailWithAccess } from "./config";
+import { resolveApiKey } from "./config-utils";
 import { getGlobalSkillsDir } from "./skill";
 import { buildSkillDownloadUrl } from "./skill-download-token";
 import { buildSkillArchive, getSkillArchivePath, getSkillSourceDir } from "./skill-fs";
@@ -70,13 +72,16 @@ function toLaunchModelProtocol(
   );
 }
 
-/** 运行时只认正式的 modelId 外键，避免继续读取迁移期字符串字段。 */
+/** 运行时只认正式的 modelId 外键；未指定时回退到当前组织第一个可用模型。 */
 async function resolveModelConfig(agentConfig: AgentConfigDetailWithAccess): Promise<ModelConfig> {
   if (!agentConfig.modelId) {
-    throwInvalidConfig(
-      `AgentConfig '${agentConfig.id}' has no model configured`,
-      `[launch-spec-builder] missing modelId for agentConfig='${agentConfig.id}', org='${agentConfig.organizationId}'`,
+    log(
+      `[launch-spec-builder] agentConfig '${agentConfig.id}' has no modelId, falling back to first available model in org '${agentConfig.organizationId}'`,
     );
+    return resolveFirstReadableModelConfig({
+      organizationId: agentConfig.organizationId,
+      userId: agentConfig.userId ?? agentConfig.organizationId,
+    });
   }
 
   const modelRows = await db.select().from(model).where(eq(model.id, agentConfig.modelId)).limit(1);
@@ -108,8 +113,11 @@ async function resolveModelConfig(agentConfig: AgentConfigDetailWithAccess): Pro
     provider: matchedProvider.name,
     protocol: toLaunchModelProtocol(matchedProvider.protocol, matchedProvider.name, agentConfig.id),
     baseUrl: matchedProvider.baseUrl || "",
-    apiKey: matchedProvider.apiKey || "",
+    apiKey: resolveApiKey(matchedProvider.apiKey) ?? "",
     model: matchedModel.modelId,
+    // opencode / ccb 引擎用 modelName 作为运行时模型标识（如 ANTHROPIC_MODEL 环境变量）。
+    // 数据库 model.modelId 即用户配置的模型名（如 deepseek-v4-flash），直接透传。
+    modelName: matchedModel.modelId,
   };
 }
 
@@ -153,8 +161,9 @@ async function resolveFirstReadableModelConfig(input: {
       provider: providerRow.name,
       protocol: toLaunchModelProtocol(providerRow.protocol, providerRow.name, input.environmentId ?? "minimal"),
       baseUrl: providerRow.baseUrl || "",
-      apiKey: providerRow.apiKey || "",
+      apiKey: resolveApiKey(providerRow.apiKey) ?? "",
       model: firstModel.modelId,
+      modelName: firstModel.modelId,
     };
   }
 
@@ -473,8 +482,45 @@ export async function buildLaunchSpec(input: BuildLaunchSpecInput): Promise<Agen
   log(
     `[launch-spec-builder] buildLaunchSpec: final skills=${JSON.stringify(skills)}, final mcpServers=${JSON.stringify(summarizeLaunchMcpServers(mcpServers))}`,
   );
+  const finalPrompt = composeAgentSystemPrompt(config.agentSystemPrompt, agentConfig.name, agentConfig.prompt);
 
   // Phase 3: 产出最终 launchSpec，此时所有关键资源都已经完成严格校验。
+  // 处理 extra.plugin：对 Hindsight 条目注入服务端动态配置
+  let processedExtra = (agentConfig.extra as Record<string, unknown> | null | undefined) ?? null;
+  if (processedExtra && Array.isArray(processedExtra.plugin)) {
+    const hindsightUrl = process.env.HINDSIGHT_MCP_URL;
+    if (hindsightUrl) {
+      let bankId: string | null = null;
+      try {
+        const rows = await db
+          .select({ id: member.id })
+          .from(member)
+          .where(and(eq(member.organizationId, organizationId), eq(member.userId, userId)))
+          .limit(1);
+        bankId = rows[0]?.id ?? null;
+      } catch (err) {
+        logError(`[launch-spec-builder] failed to resolve memberId for Hindsight bankId: ${String(err)}`);
+      }
+
+      const injectedPlugin = (processedExtra.plugin as Array<[string, Record<string, unknown>]>).map(
+        ([name, config]) => {
+          if (name === "@konghayao/opencode-hindsight") {
+            return [
+              name,
+              {
+                ...config,
+                hindsightApiUrl: hindsightUrl,
+                ...(bankId ? { bankId } : {}),
+              },
+            ] as [string, Record<string, unknown>];
+          }
+          return [name, config] as [string, Record<string, unknown>];
+        },
+      );
+      processedExtra = { ...processedExtra, plugin: injectedPlugin };
+    }
+  }
+
   return {
     organizationId,
     userId,
@@ -482,7 +528,8 @@ export async function buildLaunchSpec(input: BuildLaunchSpecInput): Promise<Agen
     env: input.extraEnv ?? {},
     agent: {
       name: agentConfig.name,
-      ...(agentConfig.prompt ? { prompt: agentConfig.prompt } : {}),
+      prompt: finalPrompt,
+      ...(processedExtra ? { extra: processedExtra } : {}),
     },
     model,
     skills,
@@ -509,6 +556,7 @@ export async function buildBasicLaunchSpec(input: BuildBasicLaunchSpecInput): Pr
     env: input.extraEnv ?? {},
     agent: {
       name: "build",
+      prompt: composeAgentSystemPrompt(config.agentSystemPrompt, "build"),
     },
     model: modelConfig,
     skills: [],

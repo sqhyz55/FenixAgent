@@ -1,4 +1,5 @@
 import type {
+  DocumentChunk,
   DocumentsResponse,
   EntityGraphResponse,
   EntityItem,
@@ -18,7 +19,8 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     credentials: "include",
     ...options,
     headers: {
-      "Content-Type": "application/json",
+      // FormData 提交时不能手动设 Content-Type，浏览器会自动加 multipart/form-data boundary
+      ...(options?.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
       ...options?.headers,
     },
   });
@@ -26,12 +28,13 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     const error = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
     throw new Error(error.error ?? `HTTP ${res.status}`);
   }
-  return res.json();
+  const json = (await res.json()) as { data?: T } | T;
+  return typeof json === "object" && json !== null && "data" in json ? (json.data as T) : (json as T);
 }
 
 export const hindsightApi = {
   /** 获取 Hindsight 状态 + bankId */
-  getStatus: () => apiFetch<{ success: boolean; data: HindsightStatus }>("/status"),
+  getStatus: () => apiFetch<HindsightStatus>("/status"),
 
   /** 列出内存 */
   listMemories: (params?: { type?: string; q?: string; limit?: number; offset?: number }) => {
@@ -47,8 +50,7 @@ export const hindsightApi = {
   getMemory: (id: string) => apiFetch<MemoryDetail>(`/memories/${encodeURIComponent(id)}`),
 
   /** 删除内存 */
-  deleteMemory: (id: string) =>
-    apiFetch<{ success: boolean }>(`/memories/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  deleteMemory: (id: string) => apiFetch<unknown>(`/memories/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   /** Recall 搜索 */
   recall: (params: { query: string; types?: string[]; max_tokens?: number }) =>
@@ -87,11 +89,11 @@ export const hindsightApi = {
     if (params.tags) qs.set("tags", params.tags.join(","));
     if (params.document_id) qs.set("document_id", params.document_id);
     if (params.chunk_id) qs.set("chunk_id", params.chunk_id);
-    return apiFetch<Record<string, any>>(`/graph?${qs.toString()}`);
+    return apiFetch<Record<string, unknown>>(`/graph?${qs.toString()}`);
   },
 
   /** 获取 Bank 统计信息（整合状态等） */
-  getBankStats: () => apiFetch<Record<string, any>>("/bank-stats"),
+  getBankStats: () => apiFetch<Record<string, unknown>>("/bank-stats"),
 
   /** 列出文档 */
   listDocuments: (params?: { q?: string; limit?: number; offset?: number }) => {
@@ -102,28 +104,32 @@ export const hindsightApi = {
     return apiFetch<DocumentsResponse>(`/documents?${qs.toString()}`);
   },
 
-  /** 上传文档（multipart/form-data，不设 Content-Type 让浏览器自动处理 boundary） */
+  /** 上传文档（multipart/form-data，Content-Type 由 apiFetch 中 FormData 检测自动跳过） */
   uploadDocument: (file: File) => {
     const formData = new FormData();
     formData.append("file", file);
     return apiFetch<{ document_id: string }>("/documents", {
       method: "POST",
-      // FormData 提交时不能手动设 Content-Type，浏览器会自动加 boundary
-      headers: {} as Record<string, string>,
       body: formData,
     });
   },
 
   /** 删除文档 */
-  deleteDocument: (id: string) =>
-    apiFetch<{ success: boolean }>(`/documents/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  deleteDocument: (id: string) => apiFetch<unknown>(`/documents/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  /** 获取文档分块列表 */
+  getDocumentChunks: (id: string) =>
+    apiFetch<{ items: DocumentChunk[] }>(`/documents/${encodeURIComponent(id)}/chunks`),
 
   /** 列出心理模型 */
   listMentalModels: () => apiFetch<{ items: MentalModel[] }>("/mental-models"),
 
+  /** 获取单个心理模型详情 */
+  getMentalModel: (id: string) => apiFetch<MentalModel>(`/mental-models/${encodeURIComponent(id)}`),
+
   /** 删除心理模型 */
   deleteMentalModel: (id: string) =>
-    apiFetch<{ success: boolean }>(`/mental-models/${encodeURIComponent(id)}`, {
+    apiFetch<unknown>(`/mental-models/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
 

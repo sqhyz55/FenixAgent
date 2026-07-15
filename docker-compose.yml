@@ -1,10 +1,13 @@
 # 开发环境 — 只启动周围基础设施，本地用 bun run dev 跑 RCS
 # Usage: docker compose up -d
 
+include:
+    - ./docker/ragflow/docker-compose.yml
+
 services:
+
     postgres:
         image: postgres:16-alpine
-        container_name: fenix-postgres
         restart: unless-stopped
         environment:
             POSTGRES_USER: rcs
@@ -20,80 +23,5 @@ services:
             timeout: 5s
             retries: 5
 
-    openviking:
-        image: openviking/openviking:v0.3.14
-        container_name: fenix-openviking
-        profiles:
-            - openviking
-        restart: unless-stopped
-        ports:
-            - "1933:1933"
-            - "8020:8020"
-        volumes:
-            - ./deploy/openviking/ov.conf:/app/.openviking/ov.conf
-            - openviking-data:/app/data
-        healthcheck:
-            test:
-                [
-                    "CMD-SHELL",
-                    "curl -fsS http://127.0.0.1:1933/health || exit 1",
-                ]
-            interval: 30s
-            timeout: 5s
-            retries: 5
-            start_period: 20s
-
-    rustfs:
-        image: rustfs/rustfs:latest
-        container_name: fenix-rustfs
-        restart: unless-stopped
-        ports:
-            - "9000:9000"
-            - "9001:9001"
-        environment:
-            RUSTFS_VOLUMES: /data/rustfs{0..1}
-            RUSTFS_ADDRESS: 0.0.0.0:9000
-            RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
-            RUSTFS_CONSOLE_ENABLE: "true"
-            RUSTFS_ACCESS_KEY: rustfsadmin
-            RUSTFS_SECRET_KEY: rustfsadmin@123
-            RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
-        volumes:
-            - rustfs-data:/data
-        depends_on:
-            rustfs-setup:
-                condition: service_completed_successfully
-        healthcheck:
-            test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
-            interval: 15s
-            timeout: 5s
-            retries: 3
-            start_period: 10s
-
-    rustfs-setup:
-        image: alpine:latest
-        container_name: fenix-rustfs-setup
-        user: root
-        volumes:
-            - rustfs-data:/data
-        command: chown -R 10001:10001 /data
-
-    rustfs-init:
-        image: minio/mc:latest
-        container_name: fenix-rustfs-init
-        depends_on:
-            rustfs:
-                condition: service_healthy
-        entrypoint: >
-          /bin/sh -c "
-            mc alias set rustfs http://rustfs:9000 rustfsadmin rustfsadmin@123 &&
-            mc mb --ignore-existing rustfs/rcs-sessions &&
-            mc mb --ignore-existing rustfs/rcs-assets &&
-            mc admin config set rustfs api cors_allow_origin='*' &&
-              echo 'Buckets created, CORS configured.'
-          "
-
 volumes:
     postgres-data:
-    openviking-data:
-    rustfs-data:

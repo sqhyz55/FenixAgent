@@ -1,14 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { buildModelOptions } from "@/components/config/ModelConfigDialog";
-import { mapModelOptions } from "../pages/agent-panel/AgentFormDialog";
+import { mapMcpOptions, mapModelOptions } from "../pages/agent-panel/AgentFormDialog";
 import {
+  buildProviderInlineTestPayload,
   buildProviderPublicReadablePayload,
   canWriteProvider,
   getProviderDisplayName,
   getProviderKey,
   getProviderResourceBadgeKey,
-} from "../pages/agent-panel/pages/AgentModelsPage";
-import type { ModelEntry, ProviderInfo } from "../types/config";
+} from "../pages/agent-panel/pages/agent-models-utils";
+import type { ModelEntry, ProviderInfo, ResourceAccess } from "../types/config";
 
 const internalProvider: ProviderInfo = {
   id: "openai",
@@ -59,6 +60,16 @@ const externalModel: ModelEntry = {
   providerResourceAccess: externalProvider.resourceAccess,
 };
 
+const sharedMcpAccess: ResourceAccess = {
+  ownership: "external",
+  sourceOrganizationId: "org-source",
+  sourceOrganizationName: "Source Team",
+  resourceUid: "mcp-external",
+  resourceKey: "org-source/mcp-external",
+  manageable: false,
+  writable: false,
+};
+
 describe("provider model resource access flow", () => {
   // 内部和外部同名 provider 使用 resourceKey 区分，不会覆盖 models map
   test("uses stable provider resource keys for same-name providers", () => {
@@ -78,15 +89,35 @@ describe("provider model resource access flow", () => {
 
   // 内部 provider 公开开关复用原 set API payload，并携带 publicReadable
   test("builds public readable provider set payload", () => {
-    expect(
-      buildProviderPublicReadablePayload(
-        { apiKey: "{env:RCS_SECRET_OPENAI}", baseURL: "https://api.example.com" },
-        true,
-      ),
-    ).toEqual({
-      apiKey: "{env:RCS_SECRET_OPENAI}",
-      baseURL: "https://api.example.com",
+    expect(buildProviderPublicReadablePayload(true)).toEqual({
       publicReadable: true,
+    });
+  });
+
+  // 预取模型列表只应使用当前表单值测试，未填写的字段不应触发隐式落库。
+  test("builds inline provider test payload without forcing persistence fields", () => {
+    expect(
+      buildProviderInlineTestPayload({
+        apiKey: "sk-temp",
+        baseURL: "https://proxy.example.com",
+        protocol: "openai",
+      }),
+    ).toEqual({
+      apiKey: "sk-temp",
+      baseURL: "https://proxy.example.com",
+      protocol: "openai",
+    });
+
+    expect(
+      buildProviderInlineTestPayload({
+        apiKey: "   ",
+        baseURL: "",
+        protocol: "anthropic",
+      }),
+    ).toEqual({
+      apiKey: undefined,
+      baseURL: undefined,
+      protocol: "anthropic",
     });
   });
 
@@ -101,6 +132,24 @@ describe("provider model resource access flow", () => {
   test("agent form model options use modelId and display name", () => {
     expect(mapModelOptions([externalModel])).toEqual([
       { value: "model-uuid-shared", label: "Source Team/OpenAI Shared/Shared Model" },
+    ]);
+  });
+
+  // AgentFormDialog 的 MCP 选项只展示已启用项，避免禁用 MCP 继续出现在绑定候选中
+  test("agent form filters disabled mcp options", () => {
+    expect(
+      mapMcpOptions([
+        { id: "mcp-enabled", name: "enabled-mcp", enabled: true, resourceAccess: sharedMcpAccess },
+        { id: "mcp-disabled", name: "disabled-mcp", enabled: false, resourceAccess: sharedMcpAccess },
+      ]),
+    ).toEqual([
+      {
+        id: "mcp-enabled",
+        key: "org-source/mcp-external",
+        name: "enabled-mcp",
+        label: "Source Team/enabled-mcp",
+        resourceAccess: sharedMcpAccess,
+      },
     ]);
   });
 });

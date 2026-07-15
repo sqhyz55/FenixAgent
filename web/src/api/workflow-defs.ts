@@ -1,7 +1,7 @@
 /**
  * Workflow Definition API Client。
  *
- * 对接后端 POST /web/workflow-defs，通过 action 字段分发。
+ * 对接后端 RESTful /web/workflow-defs 端点。
  */
 
 // ── 类型定义 ──
@@ -49,150 +49,128 @@ export interface TriggerItem {
   updatedAt: string;
 }
 
+export interface WorkflowParamDefsResponse {
+  version: number;
+  params: Record<string, unknown>;
+}
+
+export interface CustomToolInputDef {
+  type: string;
+  required?: boolean;
+  description: string;
+  group?: string;
+}
+
+export interface CustomToolItem {
+  name: string;
+  description: string;
+  inputs: Record<string, CustomToolInputDef>;
+  produces: string[];
+  kind?: string;
+  color?: string;
+  env?: string[];
+}
+
 // ── API Client ──
 
-import { workflowDefApi as _sdkDefApi } from "./sdk";
+import { request } from "./request";
+
+const ENDPOINT = "/web/workflow-defs";
 
 // ── API Methods ──
 
 export const workflowDefApi = {
-  /** 创建工作流 */
-  async create(name: string, description?: string): Promise<WorkflowDefItem> {
-    return _sdkDefApi.create({ name, description }).then(({ data, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return data as WorkflowDefItem;
-    });
-  },
-
-  /** 保存草稿 */
-  async save(workflowId: string, yaml: string): Promise<void> {
-    const { error } = await _sdkDefApi.save(workflowId, yaml);
-    if (error) throw new Error((error as { message?: string }).message);
-  },
-
-  /** 发布版本 */
-  async publish(workflowId: string): Promise<WorkflowVersionItem> {
-    return _sdkDefApi.publish(workflowId).then(({ data, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return data as WorkflowVersionItem;
-    });
-  },
-
   /** 列出工作流 */
-  async list(): Promise<WorkflowDefItem[]> {
-    return _sdkDefApi.list().then(({ data, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return (data ?? []) as WorkflowDefItem[];
-    });
-  },
+  list: () => request<WorkflowDefItem[]>(ENDPOINT, { method: "GET" }),
+
+  /** 创建工作流 */
+  create: (name: string, description?: string) =>
+    request<WorkflowDefItem>(ENDPOINT, { method: "POST", body: { name, description } }),
 
   /** 获取单个工作流（含草稿内容） */
-  async get(workflowId: string): Promise<WorkflowDefItem> {
-    return _sdkDefApi.get(workflowId).then(({ data, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return data as WorkflowDefItem;
-    });
-  },
+  get: (workflowId: string) => request<WorkflowDefItem>(`${ENDPOINT}/${workflowId}`, { method: "GET" }),
 
-  /** 获取版本历史 */
-  async getVersions(workflowId: string): Promise<WorkflowVersionItem[]> {
-    return _sdkDefApi.getVersions(workflowId).then(({ data, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return (data ?? []) as WorkflowVersionItem[];
-    });
-  },
+  /** 保存草稿 */
+  save: (workflowId: string, yaml: string) =>
+    request<void>(`${ENDPOINT}/${workflowId}/draft`, { method: "PUT", body: { yaml } }),
 
-  /** 获取特定版本 YAML */
-  async getVersion(workflowId: string, version: number): Promise<VersionYamlResponse> {
-    return _sdkDefApi.getVersion(workflowId, version).then(({ data, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return data as VersionYamlResponse;
-    });
-  },
-
-  /** 设置 latest 指针（回滚） */
-  async setLatest(workflowId: string, version: number): Promise<void> {
-    const { error } = await _sdkDefApi.setLatest(workflowId, version);
-    if (error) throw new Error((error as { message?: string }).message);
-  },
+  /** 发布版本 */
+  publish: (workflowId: string) =>
+    request<WorkflowVersionItem>(`${ENDPOINT}/${workflowId}/publish`, { method: "POST" }),
 
   /** 删除工作流 */
-  async delete(workflowId: string): Promise<void> {
-    const { error } = await _sdkDefApi.delete(workflowId);
-    if (error) throw new Error((error as { message?: string }).message);
-  },
+  delete: (workflowId: string) => request<void>(`${ENDPOINT}/${workflowId}`, { method: "DELETE" }),
 
   /** 更新元数据 */
-  async updateMeta(workflowId: string, data: { name?: string; description?: string }): Promise<WorkflowDefItem> {
-    return _sdkDefApi.updateMeta(workflowId, data).then(({ data: d, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return d as WorkflowDefItem;
-    });
-  },
+  updateMeta: (workflowId: string, data: { name?: string; description?: string }) =>
+    request<WorkflowDefItem>(`${ENDPOINT}/${workflowId}`, { method: "PATCH", body: data }),
 
-  /** 扫描可恢复的工作流 ID */
-  async recover(): Promise<string[]> {
-    const { data, error } = await _sdkDefApi.recover();
-    if (error) throw new Error((error as { message?: string }).message);
-    return (data ?? []) as string[];
-  },
+  /** 获取版本历史 */
+  getVersions: (workflowId: string) =>
+    request<WorkflowVersionItem[]>(`${ENDPOINT}/${workflowId}/versions`, { method: "GET" }),
 
-  /** 执行恢复 */
-  async recoverApply(workflowIds: string[]): Promise<WorkflowDefItem[]> {
-    const { data, error } = await _sdkDefApi.recoverApply(workflowIds);
-    if (error) throw new Error((error as { message?: string }).message);
-    return (data ?? []) as WorkflowDefItem[];
-  },
+  /** 获取特定版本 YAML */
+  getVersion: (workflowId: string, version: number) =>
+    request<VersionYamlResponse>(`${ENDPOINT}/${workflowId}/versions/${version}`, { method: "GET" }),
+
+  /** 设置 latest 指针（回滚） */
+  setLatest: (workflowId: string, version: number) =>
+    request<void>(`${ENDPOINT}/${workflowId}/versions/${version}/set-latest`, { method: "POST" }),
 
   /** 恢复版本到草稿 */
-  async restoreToDraft(workflowId: string, version: number): Promise<void> {
-    const { error } = await _sdkDefApi.restoreToDraft(workflowId, version);
-    if (error) throw new Error((error as { message?: string }).message);
-  },
+  restoreToDraft: (workflowId: string, version: number) =>
+    request<void>(`${ENDPOINT}/${workflowId}/versions/${version}/restore`, { method: "POST" }),
+
+  /** 获取工作流参数定义（从 YAML 解析） */
+  getParamDefs: (workflowId: string, version?: number) =>
+    request<WorkflowParamDefsResponse>(`${ENDPOINT}/${workflowId}/params`, {
+      method: "GET",
+      query: version !== undefined ? { version: String(version) } : undefined,
+    }),
+
+  /** 扫描可恢复的工作流 ID */
+  recover: () => request<string[]>(`${ENDPOINT}/recoverable`, { method: "GET" }),
+
+  /** 执行恢复 */
+  recoverApply: (workflowIds: string[]) =>
+    request<WorkflowDefItem[]>(`${ENDPOINT}/recover`, { method: "POST", body: { workflowIds } }),
 
   // ── Triggers ──
 
   /** 创建 webhook trigger */
-  async createTrigger(workflowId: string, type?: string, config?: Record<string, unknown>): Promise<TriggerItem> {
-    return _sdkDefApi
-      .createTrigger(workflowId, type, config)
-      .then(({ data, error }: { data?: unknown; error?: unknown }) => {
-        if (error) throw new Error((error as { message?: string }).message);
-        return data as TriggerItem;
-      });
-  },
+  createTrigger: (workflowId: string, type?: string, config?: Record<string, unknown>) =>
+    request<TriggerItem>(`${ENDPOINT}/${workflowId}/triggers`, {
+      method: "POST",
+      body: { type, config },
+    }),
 
   /** 列出 workflow 的所有 trigger */
-  async listTriggers(workflowId: string): Promise<TriggerItem[]> {
-    return _sdkDefApi.listTriggers(workflowId).then(({ data, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return Array.isArray(data) ? (data as TriggerItem[]) : [];
-    });
-  },
+  listTriggers: (workflowId: string) => request<TriggerItem[]>(`${ENDPOINT}/${workflowId}/triggers`, { method: "GET" }),
 
   /** 删除 trigger */
-  async deleteTrigger(triggerId: string): Promise<void> {
-    const { error } = await _sdkDefApi.deleteTrigger(triggerId);
-    if (error) throw new Error((error as { message?: string }).message);
-  },
+  deleteTrigger: (workflowId: string, triggerId: string) =>
+    request<void>(`${ENDPOINT}/${workflowId}/triggers/${triggerId}`, { method: "DELETE" }),
 
   /** 重新生成 hash */
-  async regenerateTriggerHash(triggerId: string): Promise<TriggerItem> {
-    return _sdkDefApi.regenerateTriggerHash(triggerId).then(({ data, error }: { data?: unknown; error?: unknown }) => {
-      if (error) throw new Error((error as { message?: string }).message);
-      return data as TriggerItem;
-    });
-  },
+  regenerateTriggerHash: (workflowId: string, triggerId: string) =>
+    request<TriggerItem>(`${ENDPOINT}/${workflowId}/triggers/${triggerId}/regenerate`, { method: "POST" }),
 
   /** 启用 trigger */
-  async enableTrigger(triggerId: string): Promise<void> {
-    const { error } = await _sdkDefApi.enableTrigger(triggerId);
-    if (error) throw new Error((error as { message?: string }).message);
-  },
+  enableTrigger: (workflowId: string, triggerId: string) =>
+    request<void>(`${ENDPOINT}/${workflowId}/triggers/${triggerId}/enable`, { method: "POST" }),
 
   /** 禁用 trigger */
-  async disableTrigger(triggerId: string): Promise<void> {
-    const { error } = await _sdkDefApi.disableTrigger(triggerId);
-    if (error) throw new Error((error as { message?: string }).message);
+  disableTrigger: (workflowId: string, triggerId: string) =>
+    request<void>(`${ENDPOINT}/${workflowId}/triggers/${triggerId}/disable`, { method: "POST" }),
+};
+
+export const customToolsApi = {
+  list: async (): Promise<CustomToolItem[]> => {
+    const r = await fetch("/web/workflow-custom-tools", { credentials: "include" });
+    if (!r.ok) {
+      throw new Error(`Failed to load custom tools: ${r.status}`);
+    }
+    const json = (await r.json()) as { success?: boolean; data?: CustomToolItem[] };
+    return Array.isArray(json.data) ? json.data : [];
   },
 };

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -20,6 +20,38 @@ async function defaultExtractArchive(archivePath: string, targetDir: string): Pr
 }
 
 /**
+ * 根据 RCS_URL 环境变量替换下载 URL 的 origin。
+ *
+ * RCS_URL 是 WebSocket 地址（ws:// 或 wss://），
+ * 转换为对应的 HTTP 协议后替换原始 URL 的 origin 部分。
+ * 未设置 RCS_URL 时维持原样。
+ */
+function resolveDownloadUrl(originalUrl: string): string {
+  const rcsUrl = process.env.RCS_URL;
+  if (!rcsUrl) return originalUrl;
+
+  // ws://host:port → http://host:port  /  wss://host:port → https://host:port
+  const httpUrl = rcsUrl.replace(/^ws(s?):\/\//, "http$1://");
+  const base = new URL(httpUrl);
+  const original = new URL(originalUrl);
+
+  return `${base.origin}${original.pathname}${original.search}`;
+}
+
+/**
+ * 清空 workspace 中已安装的所有 skill 目录，prepare 阶段再按当前 launchSpec 全量重建。
+ */
+async function clearInstalledSkills(skillsDir: string): Promise<void> {
+  const entries = await readdir(skillsDir, { withFileTypes: true });
+
+  await Promise.all(
+    entries.map(async (entry) => {
+      await rm(join(skillsDir, entry.name), { recursive: true, force: true });
+    }),
+  );
+}
+
+/**
  * 下载并安装 launchSpec 中声明的 skills。
  */
 export async function installSkills(
@@ -27,15 +59,16 @@ export async function installSkills(
   skills: SkillConfig[],
   dependencies: SkillInstallerDependencies = {},
 ): Promise<InstalledSkillReference[]> {
+  const { skillsDir } = await ensureWorkspaceRuntimeDirs(workspace);
+  await clearInstalledSkills(skillsDir);
+
   if (skills.length === 0) {
     console.log(`[skill-installer] 无 skills 需要安装, workspace=${workspace}`);
-    await ensureWorkspaceRuntimeDirs(workspace);
     return [];
   }
 
   const fetchImpl = dependencies.fetch ?? fetch;
   const extractArchive = dependencies.extractArchive ?? defaultExtractArchive;
-  const { skillsDir } = await ensureWorkspaceRuntimeDirs(workspace);
   console.log(
     `[skill-installer] 开始安装 ${skills.length} 个 skills: workspace=${workspace}, skillsDir=${skillsDir}, skill 列表=[${skills.map((s) => `${s.name}(${s.url.slice(0, 80)}...)`).join(", ")}]`,
   );
@@ -48,12 +81,13 @@ export async function installSkills(
       const archivePath = join(tempRoot, `${skill.name}.zip`);
       const targetDir = join(skillsDir, skill.name);
 
-      console.log(`[skill-installer] 下载 skill "${skill.name}": url=${skill.url.slice(0, 120)}...`);
+      const downloadUrl = resolveDownloadUrl(skill.url);
+      console.log(`[skill-installer] 下载 skill "${skill.name}": url=${downloadUrl.slice(0, 120)}...`);
       await rm(targetDir, { recursive: true, force: true });
       await mkdir(targetDir, { recursive: true });
       await mkdir(dirname(archivePath), { recursive: true });
 
-      const response = await fetchImpl(skill.url);
+      const response = await fetchImpl(downloadUrl);
       if (!response.ok) {
         console.error(
           `[skill-installer] 下载 skill "${skill.name}" 失败: status=${response.status} ${response.statusText}, url=${skill.url}`,

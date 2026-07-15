@@ -1,12 +1,7 @@
-const DEFAULT_APP_NAME = "Fenix";
+import { brandingApi } from "@/src/api/branding";
 
-interface BrandingResponse {
-  success: true;
-  data: {
-    brandName: string;
-    logoUrl: string | null;
-  };
-}
+const DEFAULT_APP_NAME = "Fenix Agent";
+const DEFAULT_LOGO_PATH = "/ctrl/brand/fenix-agent-logo-mark.png";
 
 interface AppBrand {
   name: string;
@@ -14,7 +9,7 @@ interface AppBrand {
   monogram: string;
 }
 
-let appBrand: AppBrand = createBrand(DEFAULT_APP_NAME, null);
+let appBrand: AppBrand = createBrand(DEFAULT_APP_NAME, DEFAULT_LOGO_PATH);
 
 function createBrand(name: string, logoUrl: string | null): AppBrand {
   const normalizedName = name.trim() || DEFAULT_APP_NAME;
@@ -23,32 +18,6 @@ function createBrand(name: string, logoUrl: string | null): AppBrand {
     logoUrl,
     monogram: normalizedName.charAt(0).toUpperCase() || DEFAULT_APP_NAME.charAt(0),
   };
-}
-
-function buildMonogramIconDataUrl(monogram: string): string {
-  const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-      <defs>
-        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#6366f1" />
-          <stop offset="100%" stop-color="#8b5cf6" />
-        </linearGradient>
-      </defs>
-      <rect width="64" height="64" rx="14" fill="url(#bg)" />
-      <text
-        x="50%"
-        y="50%"
-        fill="#ffffff"
-        font-family="ui-sans-serif, system-ui, sans-serif"
-        font-size="30"
-        font-weight="700"
-        text-anchor="middle"
-        dominant-baseline="central"
-      >${monogram}</text>
-    </svg>
-  `;
-
-  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
 /**
@@ -63,12 +32,14 @@ export function getAppBrand(): AppBrand {
  */
 export async function loadAppBrand(): Promise<void> {
   try {
-    const response = await fetch("/web/branding");
-    if (!response.ok) return;
-    const payload = (await response.json()) as BrandingResponse;
-    appBrand = createBrand(payload.data.brandName, payload.data.logoUrl);
+    const resp = await brandingApi.get();
+    if (resp.success && resp.data) {
+      appBrand = createBrand(resp.data.brandName, resp.data.logoUrl);
+    }
   } catch {
-    appBrand = createBrand(DEFAULT_APP_NAME, null);
+    // brandingApi.get() 内部已通过 request() 兜底处理网络异常并返回 success: false，
+    // 此处 catch 仅处理极端情况（如 request 模块加载失败），保持静默降级。
+    appBrand = createBrand(DEFAULT_APP_NAME, DEFAULT_LOGO_PATH);
   }
 }
 
@@ -80,9 +51,9 @@ export function applyAppBrandToDocument(): void {
 
   const brand = getAppBrand();
   document.title = brand.name;
-  const faviconUrl = brand.logoUrl ?? buildMonogramIconDataUrl(brand.monogram);
+  const faviconUrl = brand.logoUrl ?? DEFAULT_LOGO_PATH;
 
-  for (const rel of ["icon", "shortcut icon"]) {
+  for (const rel of ["icon", "apple-touch-icon"]) {
     const selector = `link[rel='${rel}']`;
     const existing = document.head.querySelector<HTMLLinkElement>(selector);
     const link = existing ?? document.createElement("link");

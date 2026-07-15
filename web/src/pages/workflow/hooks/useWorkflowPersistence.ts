@@ -2,9 +2,10 @@ import type { Edge, Node } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import { unwrap } from "../../../api/request";
 import { workflowDefApi } from "../../../api/workflow-defs";
 import { pushWorkflowError } from "../../../lib/use-workflow-events";
-import { flowToYaml, type WfMeta, yamlToFlow } from "../yaml-utils";
+import { flowToYaml, syncEdgeCounter, syncNodeCounter, type WfMeta, yamlToFlow } from "../yaml-utils";
 
 const AUTO_SAVE_DELAY = 3000;
 
@@ -80,7 +81,11 @@ export function useWorkflowPersistence(params: UseWorkflowPersistenceParams): Us
   }, [nodes, edges, meta, setYamlText]);
 
   const currentYaml = useMemo(() => flowToYaml(nodes, edges, meta), [nodes, edges, meta]);
-  const hasUnsavedChanges = lastSavedYaml !== "" && currentYaml !== lastSavedYaml;
+  // 用 currentYaml !== "" 而不是 lastSavedYaml !== "" 作 guard：
+  // 新 workflow（draftYaml 为空）首次编辑时 lastSavedYaml 仍是 ""，
+  // 旧逻辑会让 hasUnsavedChanges 永远 false，用户改了也不显示未保存。
+  // 现在：当前 yaml 非空且与已保存版本不一致 → 未保存。
+  const hasUnsavedChanges = currentYaml !== "" && currentYaml !== lastSavedYaml;
 
   useEffect(() => {
     if (hasUnsavedChanges && saveStatus !== "unsaved" && saveStatus !== "saving") {
@@ -98,7 +103,7 @@ export function useWorkflowPersistence(params: UseWorkflowPersistenceParams): Us
       const y = syncYaml();
       setSaveStatus("saving");
       try {
-        await workflowDefApi.save(workflowId, y);
+        await unwrap(workflowDefApi.save(workflowId, y));
         setLastSavedYaml(y);
         if (silent) {
           setSaveStatus("idle");
@@ -109,7 +114,7 @@ export function useWorkflowPersistence(params: UseWorkflowPersistenceParams): Us
         return true;
       } catch (err) {
         console.error(err);
-        pushWorkflowError("save", (err as Error).message);
+        pushWorkflowError(workflowId, "save", (err as Error).message);
         toast.error(`${t("editor.save_failed")}: ${(err as Error).message}`);
         setSaveStatus("unsaved");
         return false;
@@ -149,6 +154,8 @@ export function useWorkflowPersistence(params: UseWorkflowPersistenceParams): Us
       if (!text) return;
       try {
         const { nodes: newNodes, edges: newEdges, meta: newMeta } = yamlToFlow(text);
+        syncNodeCounter(newNodes.map((n) => n.id));
+        syncEdgeCounter(newEdges.map((e) => e.id));
         setNodes(newNodes);
         setEdges(newEdges);
         setMeta(() => newMeta);
@@ -197,6 +204,8 @@ export function useWorkflowPersistence(params: UseWorkflowPersistenceParams): Us
         const text = ev.target?.result as string;
         try {
           const { nodes: newNodes, edges: newEdges, meta: newMeta } = yamlToFlow(text);
+          syncNodeCounter(newNodes.map((n) => n.id));
+          syncEdgeCounter(newEdges.map((e) => e.id));
           setNodes(newNodes);
           setEdges(newEdges);
           setMeta(() => newMeta);
@@ -220,7 +229,7 @@ export function useWorkflowPersistence(params: UseWorkflowPersistenceParams): Us
     const y = syncYaml();
     setSaveStatus("saving");
     try {
-      await workflowDefApi.save(workflowId, y);
+      await unwrap(workflowDefApi.save(workflowId, y));
       setLastSavedYaml(y);
       setSaveStatus("idle");
     } catch (err) {
@@ -232,11 +241,11 @@ export function useWorkflowPersistence(params: UseWorkflowPersistenceParams): Us
 
     setPublishing(true);
     try {
-      const result = await workflowDefApi.publish(workflowId);
+      const result = await unwrap(workflowDefApi.publish(workflowId));
       toast.success(t("editor.published_as", { version: result.version }));
     } catch (err) {
       console.error(err);
-      pushWorkflowError("publish", (err as Error).message);
+      pushWorkflowError(workflowId, "publish", (err as Error).message);
       toast.error(`${t("editor.publish_failed")}: ${(err as Error).message}`);
     } finally {
       setPublishing(false);

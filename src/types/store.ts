@@ -98,6 +98,12 @@ export interface InstanceSupplement {
   environmentId: string;
   instanceNumber: number;
   organizationId: string;
+  /** 最近一次非保活 ACP 业务消息时间 */
+  lastActivityAt: number;
+  /** 当前绑定到该实例的前端 relay 连接数 */
+  relayCount: number;
+  /** 最后一次 relay 全部断开、实例进入空闲观察窗口的时间 */
+  lastRelayDetachedAt: number | null;
 }
 
 // ────────────────────────────────────────────
@@ -120,21 +126,6 @@ export interface ScheduledJobEntry {
 export interface RateLimitEntry {
   count: number;
   resetAt: number;
-}
-
-// ────────────────────────────────────────────
-// Session Worker
-// Extracted from: src/repositories/session-worker.ts
-// ────────────────────────────────────────────
-
-/** Worker status values reported by ACP agent */
-export type WorkerStatus = "idle" | "running" | "requires_action" | "completed" | "error";
-
-/** Shape of a pending permission request from ACP agent */
-export interface PermissionRequestDetails {
-  toolName?: string;
-  input?: Record<string, unknown>;
-  requestId?: string;
 }
 
 // ────────────────────────────────────────────

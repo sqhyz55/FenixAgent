@@ -1,7 +1,7 @@
 import i18n from "i18next";
 import LanguageDetector from "i18next-browser-languagedetector";
 import { initReactI18next } from "react-i18next";
-
+import agentHomeEN from "./locales/en/agentHome.json";
 import agentPanelEN from "./locales/en/agentPanel.json";
 import agentsEN from "./locales/en/agents.json";
 import apikeyEN from "./locales/en/apikey.json";
@@ -11,17 +11,21 @@ import componentsEN from "./locales/en/components.json";
 import dashboardEN from "./locales/en/dashboard.json";
 import environmentsEN from "./locales/en/environments.json";
 import hindsightEN from "./locales/en/hindsight.json";
-import kanbanEN from "./locales/en/kanban.json";
 import knowledgeEN from "./locales/en/knowledge.json";
 import loginEN from "./locales/en/login.json";
 import mcpEN from "./locales/en/mcp.json";
 import modelsEN from "./locales/en/models.json";
 import orgsEN from "./locales/en/orgs.json";
+import prodViewsEN from "./locales/en/prodViews.json";
 import sessionsEN from "./locales/en/sessions.json";
+import settingsEN from "./locales/en/settings.json";
 import sidebarEN from "./locales/en/sidebar.json";
 import skillsEN from "./locales/en/skills.json";
 import tasksEN from "./locales/en/tasks.json";
+import tasksV2EN from "./locales/en/tasks-v2.json";
+import toolNarratorEN from "./locales/en/toolNarrator.json";
 import workflowsEN from "./locales/en/workflows.json";
+import agentHomeZH from "./locales/zh/agentHome.json";
 import agentPanelZH from "./locales/zh/agentPanel.json";
 import agentsZH from "./locales/zh/agents.json";
 import apikeyZH from "./locales/zh/apikey.json";
@@ -31,16 +35,19 @@ import componentsZH from "./locales/zh/components.json";
 import dashboardZH from "./locales/zh/dashboard.json";
 import environmentsZH from "./locales/zh/environments.json";
 import hindsightZH from "./locales/zh/hindsight.json";
-import kanbanZH from "./locales/zh/kanban.json";
 import knowledgeZH from "./locales/zh/knowledge.json";
 import loginZH from "./locales/zh/login.json";
 import mcpZH from "./locales/zh/mcp.json";
 import modelsZH from "./locales/zh/models.json";
 import orgsZH from "./locales/zh/orgs.json";
+import prodViewsZH from "./locales/zh/prodViews.json";
 import sessionsZH from "./locales/zh/sessions.json";
+import settingsZH from "./locales/zh/settings.json";
 import sidebarZH from "./locales/zh/sidebar.json";
 import skillsZH from "./locales/zh/skills.json";
 import tasksZH from "./locales/zh/tasks.json";
+import tasksV2ZH from "./locales/zh/tasks-v2.json";
+import toolNarratorZH from "./locales/zh/toolNarrator.json";
 import workflowsZH from "./locales/zh/workflows.json";
 
 export const NS = {
@@ -53,7 +60,9 @@ export const NS = {
   SKILLS: "skills",
   MCP: "mcp",
   TASKS: "tasks",
+  TASKS_V2: "tasksV2",
   WORKFLOWS: "workflows",
+  SETTINGS: "settings",
   SESSIONS: "sessions",
   ENVIRONMENTS: "environments",
   ORGS: "orgs",
@@ -62,8 +71,10 @@ export const NS = {
   KNOWLEDGE: "knowledge",
   AGENT_PANEL: "agentPanel",
   COMPONENTS: "components",
-  KANBAN: "kanban",
   HINDSIGHT: "hindsight",
+  AGENT_HOME: "agentHome",
+  PROD_VIEWS: "prodViews",
+  TOOL_NARRATOR: "toolNarrator",
 } as const;
 
 export type Namespace = (typeof NS)[keyof typeof NS];
@@ -79,6 +90,7 @@ i18n
         [NS.SIDEBAR]: sidebarEN,
         [NS.DASHBOARD]: dashboardEN,
         [NS.TASKS]: tasksEN,
+        [NS.TASKS_V2]: tasksV2EN,
         [NS.AGENTS]: agentsEN,
         [NS.MODELS]: modelsEN,
         [NS.ENVIRONMENTS]: environmentsEN,
@@ -92,8 +104,11 @@ i18n
         [NS.KNOWLEDGE]: knowledgeEN,
         [NS.COMPONENTS]: componentsEN,
         [NS.WORKFLOWS]: workflowsEN,
-        [NS.KANBAN]: kanbanEN,
+        [NS.SETTINGS]: settingsEN,
         [NS.HINDSIGHT]: hindsightEN,
+        [NS.AGENT_HOME]: agentHomeEN,
+        [NS.PROD_VIEWS]: prodViewsEN,
+        [NS.TOOL_NARRATOR]: toolNarratorEN,
       },
       zh: {
         [NS.COMMON]: commonZH,
@@ -101,6 +116,7 @@ i18n
         [NS.SIDEBAR]: sidebarZH,
         [NS.DASHBOARD]: dashboardZH,
         [NS.TASKS]: tasksZH,
+        [NS.TASKS_V2]: tasksV2ZH,
         [NS.AGENTS]: agentsZH,
         [NS.MODELS]: modelsZH,
         [NS.ENVIRONMENTS]: environmentsZH,
@@ -114,8 +130,11 @@ i18n
         [NS.KNOWLEDGE]: knowledgeZH,
         [NS.COMPONENTS]: componentsZH,
         [NS.WORKFLOWS]: workflowsZH,
-        [NS.KANBAN]: kanbanZH,
+        [NS.SETTINGS]: settingsZH,
         [NS.HINDSIGHT]: hindsightZH,
+        [NS.AGENT_HOME]: agentHomeZH,
+        [NS.PROD_VIEWS]: prodViewsZH,
+        [NS.TOOL_NARRATOR]: toolNarratorZH,
       },
     },
     fallbackLng: "en",
@@ -126,6 +145,7 @@ i18n
       NS.SIDEBAR,
       NS.DASHBOARD,
       NS.TASKS,
+      NS.TASKS_V2,
       NS.ENVIRONMENTS,
       NS.SKILLS,
       NS.MCP,
@@ -137,8 +157,11 @@ i18n
       NS.KNOWLEDGE,
       NS.COMPONENTS,
       NS.WORKFLOWS,
-      NS.KANBAN,
+      NS.SETTINGS,
       NS.HINDSIGHT,
+      NS.AGENT_HOME,
+      NS.PROD_VIEWS,
+      NS.TOOL_NARRATOR,
     ],
     interpolation: { escapeValue: false },
     detection: {

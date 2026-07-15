@@ -78,6 +78,8 @@ export interface DAGRunResult {
   runId: string;
   status: DAGStatus;
   summary: RunSummary;
+  /** 节点输出快照：用于同步调用方在 DAG 完成后立即读取最终节点结果。 */
+  outputs?: Record<string, NodeOutput>;
   /** 本次运行期间启动的 Environment ID 列表 */
   spawnedEnvIds?: string[];
 }
@@ -232,10 +234,13 @@ export class DAGScheduler {
         runId: this.ctx.runId,
         status: finalStatus,
         summary,
+        // storage 持久化可能在不同适配器上存在可见性延迟；返回内存中的最终输出给同步 API 直接使用。
+        outputs: Object.fromEntries(this.nodeOutputs.entries()),
         spawnedEnvIds: this.ctx.spawnedEnvIds ? [...this.ctx.spawnedEnvIds] : [],
       };
-    } catch (_error) {
+    } catch (error) {
       // 未预期的异常 → ERROR 状态
+      console.error(`[workflow] DAG unexpected error: runId=${this.ctx.runId}`, error);
       const completedAt = new Date().toISOString();
       await this.emitEvent("dag.cancelled");
       const summary = this.buildSummary("ERROR", completedAt);
@@ -243,6 +248,8 @@ export class DAGScheduler {
         runId: this.ctx.runId,
         status: "ERROR",
         summary,
+        // 即使 DAG 异常，也保留已完成节点输出，便于调用方排查失败前的执行结果。
+        outputs: Object.fromEntries(this.nodeOutputs.entries()),
         spawnedEnvIds: this.ctx.spawnedEnvIds ? [...this.ctx.spawnedEnvIds] : [],
       };
     }
@@ -288,6 +295,10 @@ export class DAGScheduler {
     // 设置 RUNNING（执行器内部会发射 node.started 事件）
     this.nodeStates.set(nodeId, "RUNNING");
 
+    // 保存快照让前端轮询能立即看到 RUNNING 状态，
+    // 否则快照只在 DAG 启动和节点完成后才创建，RUNNING 状态对外不可见
+    await this.saveSnapshotCurrent();
+
     try {
       // 解析 ${{ }} 表达式
       const resolvedInputs = this.resolveNodeInputs(node);
@@ -306,6 +317,11 @@ export class DAGScheduler {
       // 执行节点（执行器内部发射 node.started / node.completed 事件）
       const output = await this.ctx.nodeExecutor.execute(node, execCtx);
 
+      // 求值节点 yaml 声明的 outputs.pattern，merge 到 output.json。
+      // 让下游能通过 ${{ nodes.X.output.K }} 引用 X 声明的具名输出（如 trimmed_r1 / bam）。
+      // 放在 setNodeOutputs 之前，确保下游 buildEvalContext 时能拿到注入后的 output。
+      this.injectDeclaredOutputs(node, output);
+
       // 成功 → COMPLETED + 快照（不再发射额外的 node.completed 事件）
       this.nodeStates.set(nodeId, "COMPLETED");
       this.nodeOutputs.set(nodeId, output);
@@ -322,23 +338,32 @@ export class DAGScheduler {
         throw error;
       }
 
-      // 处理 AbortError（取消）
+      const nodeType = this.nodeMap.get(nodeId)?.type ?? "unknown";
+
+      // 处理 AbortError（取消 / 超时）
       if (error instanceof DOMException && error.name === "AbortError") {
         this.nodeStates.set(nodeId, "CANCELLED");
         await this.emitEvent("node.cancelled", nodeId);
+        console.error(`[workflow] Node CANCELLED: nodeId=${nodeId} type=${nodeType} reason=${error.message}`);
         return;
       }
 
-      // 节点失败（执行器内部已发射 node.failed 事件，此处不再重复）
+      // 节点失败
       this.nodeStates.set(nodeId, "FAILED");
 
-      // 保存失败输出，使前端能查看错误详情
       const failureOutput = this.extractFailureOutput(error);
       if (failureOutput) {
         this.nodeOutputs.set(nodeId, failureOutput);
         this.lastEventId = `evt_${nanoid(10)}`;
         await this.saveSnapshotAfterNode(nodeId, failureOutput);
       }
+
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorDetail =
+        error instanceof WorkflowError && error.details?.abort_reason
+          ? ` reason=${error.details.abort_reason as string}`
+          : "";
+      console.error(`[workflow] Node FAILED: nodeId=${nodeId} type=${nodeType} error=${errorMsg}${errorDetail}`);
 
       // BFS 错误传播：标记下游为 SKIPPED
       await this.propagateFailure(nodeId);
@@ -415,6 +440,35 @@ export class DAGScheduler {
         }
         break;
       }
+      case "custom": {
+        // Custom 节点：通过 inputs 注入上游数据，executor 内做 Zod 校验
+        const customNode = node as import("../types/dag").CustomNodeDef;
+        if (customNode.inputs) {
+          resolved.inputs = resolveInputs(customNode.inputs, evalContext);
+        }
+        // script 求值(仅 SlurmNode 子类会声明 script 字段，解析器已校验 kind)
+        if (customNode.script) {
+          resolved.script = {
+            // content: 走 resolveTemplate(拼接模式，结果始终是 string)
+            content: resolveTemplate(customNode.script.content, evalContext),
+            // env: 遍历每个 value 走 resolveTemplate，统一转 string
+            env: customNode.script.env
+              ? Object.fromEntries(
+                  Object.entries(customNode.script.env).map(([k, v]) => [k, resolveTemplate(v, evalContext)]),
+                )
+              : {},
+          };
+        }
+        break;
+      }
+      case "end": {
+        // end 节点：解析 inputs 为模板变量值，供 EndExecutor 收集为最终输出
+        const endNode = node as import("../types/dag").EndNodeDef;
+        if (endNode.inputs) {
+          resolved.inputs = resolveInputs(endNode.inputs, evalContext);
+        }
+        break;
+      }
     }
 
     // 通用字段
@@ -439,8 +493,18 @@ export class DAGScheduler {
     const nodes: Record<string, { output: Record<string, unknown>; status: string }> = {};
     for (const [id, status] of this.nodeStates) {
       const output = this.nodeOutputs.get(id);
+      // json 可能是数字/字符串等非对象值（如 echo "1000" 被 JSON.parse 解析为 number 1000），
+      // 此时应回退到 { stdout } 以确保下游通过 .output.stdout 能正确取值。
+      // 同时 merge stdout 兜底字段，避免 injectDeclaredOutputs 后的 jsonObj 缺少 stdout。
+      const jsonObj =
+        output?.json !== null && typeof output?.json === "object" && !Array.isArray(output?.json)
+          ? (output.json as Record<string, unknown>)
+          : null;
       nodes[id] = {
-        output: (output?.json ?? { stdout: output?.stdout ?? "" }) as Record<string, unknown>,
+        output: (jsonObj ? { stdout: output?.stdout ?? "", ...jsonObj } : { stdout: output?.stdout ?? "" }) as Record<
+          string,
+          unknown
+        >,
         status,
       };
     }
@@ -449,6 +513,51 @@ export class DAGScheduler {
       params: this.ctx.params,
       secrets: this.ctx.secrets,
     };
+  }
+
+  /**
+   * 求值节点 yaml 声明的 outputs.pattern，merge 到 output.json。
+   *
+   * 设计目的：让下游节点能通过 ${{ nodes.X.output.K }} 引用 X 节点声明的具名输出
+   * （如 trimmed_r1 / bam / quant_sf），实现真正的 DAG 数据流，下游不再硬编码路径。
+   *
+   * 求值时机：节点 execute 成功后、存入 nodeOutputs 之前。
+   * - 此时 buildEvalContext 包含 params / secrets / 已完成的上游节点 output，
+   *   pattern 里的 ${{ params.xxx }} / ${{ nodes.Y.output.z }} 都能正确解析。
+   * - pattern 不引用自身节点输出（语义上 outputs 是"该节点对外暴露的产物声明"，
+   *   只依赖 params 和上游），所以不会循环。
+   *
+   * merge 策略：output.json 已是对象则合并（声明的 outputs 覆盖同名字段，
+   * 保留脚本主动 echo 的 JSON 字段）；否则直接用声明 outputs 作为 json。
+   * pattern 求值失败不阻塞节点完成，记录 warn 后跳过该 key（下游引用时拿到 undefined）。
+   */
+  private injectDeclaredOutputs(node: NodeDef, output: NodeOutput): void {
+    const declared = node.outputs;
+    if (!declared || Object.keys(declared).length === 0) return;
+
+    const evalContext = this.buildEvalContext();
+    const injected: Record<string, unknown> = {};
+    for (const [key, def] of Object.entries(declared)) {
+      const pattern = def?.pattern;
+      if (typeof pattern !== "string" || !pattern.trim()) continue;
+      try {
+        injected[key] = resolveTemplate(pattern, evalContext);
+      } catch (err) {
+        console.warn(
+          `[dag-scheduler] Failed to resolve outputs.${key} for node ${node.id}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
+    if (Object.keys(injected).length === 0) return;
+
+    const existing = output.json;
+    if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+      output.json = { ...(existing as Record<string, unknown>), ...injected };
+    } else {
+      output.json = injected;
+    }
   }
 
   /** BFS 错误传播 — 标记所有下游节点为 SKIPPED */
@@ -476,11 +585,26 @@ export class DAGScheduler {
     }
   }
 
-  /** 从执行器抛出的错误中提取失败输出 */
+  /**
+   * 从执行器抛出的错误中提取失败输出。
+   *
+   * 关键：必须把 stderr 也带入 stdout（拼在末尾），否则前端"输出"面板只看到
+   * "exit_code: 1 / 0B 输出"，完全不知道脚本里哪条命令挂了。
+   * 这与 SlurmNode.collectOutput 的做法一致：NodeOutput 没有 stderr 字段，
+   * 非空 stderr 拼到 stdout 末尾。
+   */
   private extractFailureOutput(error: unknown): NodeOutput | null {
     if (error instanceof WorkflowError && error.details) {
-      const stdout = (error.details.stdout as string) ?? error.message;
+      const rawStdout = (error.details.stdout as string) ?? "";
+      const rawStderr = (error.details.stderr as string) ?? "";
       const exitCode = (error.details.exit_code as number) ?? 1;
+      // 拼接顺序：原始 stdout → stderr（如有）→ error.message（stdout 为空时才附）
+      // stdout 为空时附上 error.message，让用户在前端至少看到一句可读错误
+      const parts: string[] = [];
+      if (rawStdout) parts.push(rawStdout);
+      if (rawStderr) parts.push(`[stderr]\n${rawStderr}`);
+      if (parts.length === 0) parts.push(error.message);
+      const stdout = parts.join("\n\n");
       return {
         stdout,
         exit_code: exitCode,
@@ -604,6 +728,29 @@ export class DAGScheduler {
   private async saveSnapshotAfterNode(nodeId: string, output: NodeOutput): Promise<void> {
     await this.ctx.storage.setOutput(this.ctx.runId, nodeId, output);
 
+    const nodeStates: DAGSnapshot["node_states"] = {};
+    for (const [id, s] of this.nodeStates) {
+      const nodeOutput = this.nodeOutputs.get(id);
+      nodeStates[id] = {
+        status: s,
+        ...(nodeOutput?.exit_code != null ? { exit_code: nodeOutput.exit_code } : {}),
+      };
+    }
+
+    const snapshot: DAGSnapshot = {
+      snapshot_id: `snap_${nanoid(10)}`,
+      run_id: this.ctx.runId,
+      last_event_id: this.lastEventId,
+      timestamp: new Date().toISOString(),
+      node_states: nodeStates,
+      dag_status: "RUNNING",
+    };
+
+    await this.ctx.storage.createSnapshot(snapshot);
+  }
+
+  /** 保存当前内存状态的快照（用于节点状态转为 RUNNING 时，让前端轮询能感知） */
+  private async saveSnapshotCurrent(): Promise<void> {
     const nodeStates: DAGSnapshot["node_states"] = {};
     for (const [id, s] of this.nodeStates) {
       const nodeOutput = this.nodeOutputs.get(id);

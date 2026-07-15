@@ -244,6 +244,17 @@ function useTreeState(opts: {
     [nodes, expandedSet, selectedId],
   );
 
+  // 根节点加载后，自动重载已展开节点的子节点（处理 key 变化导致的重新挂载）
+  const expandedReloadedRef = useRef(false);
+  useEffect(() => {
+    if (rootIds.length === 0 || expandedSet.size === 0) return;
+    if (expandedReloadedRef.current) return;
+    expandedReloadedRef.current = true;
+    for (const nodeId of expandedSet) {
+      loadChildren(nodeId);
+    }
+  }, [rootIds, expandedSet, loadChildren]);
+
   return {
     nodes,
     rootIds,
@@ -339,7 +350,7 @@ export function Tree({
 
   return (
     <TreeContext.Provider value={ctx}>
-      <div role="tree" data-slot="tree" className={cn("text-sm select-none", className)}>
+      <div role="tree" data-slot="tree" className={cn("text-base select-none", className)}>
         {childContent}
       </div>
     </TreeContext.Provider>
@@ -422,52 +433,47 @@ export function TreeItem({
       {/* Node row */}
       <div
         className={cn(
-          "group relative flex items-center gap-0.5 h-7 px-0.5 rounded-sm cursor-pointer",
+          "group relative flex items-center gap-0.5 h-8 pr-2 rounded-sm cursor-pointer",
           "hover:bg-accent/50",
           state.selected && "bg-primary/10 text-primary border-l-2 border-primary -ml-[2px]",
           data.isDisabled && "opacity-50 pointer-events-none",
           className,
         )}
-        style={{ paddingLeft: `${depth * 6}px` }}
+        style={{ paddingLeft: `${depth * 12 + 8}px` }}
         onClick={handleRowClick}
       >
         {/* Chevron */}
         <span
-          className={cn("flex items-center justify-center", showChevron ? "flex-shrink-0 w-4 h-4" : "w-0")}
+          className={cn("flex items-center justify-center", showChevron ? "flex-shrink-0 w-6 h-6" : "w-0")}
           onClick={showChevron ? handleChevronClick : undefined}
         >
           {state.loading ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
           ) : state.error ? (
             <button type="button" onClick={handleRetry} className="text-destructive hover:text-destructive/80">
-              <RotateCw className="h-3.5 w-3.5" />
+              <RotateCw className="h-5 w-5" />
             </button>
           ) : showChevron ? (
             state.expanded ? (
-              <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+              <ChevronDown className="h-5 w-5 text-muted-foreground" />
             ) : (
-              <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+              <ChevronRight className="h-5 w-5 text-muted-foreground" />
             )
           ) : null}
         </span>
 
-        {/* Icon */}
-        {data.icon ? (
-          <data.icon className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
-        ) : (
-          <span className="w-4 flex-shrink-0" />
-        )}
+        {/* Icon — renderLabel 自带图标时跳过，避免重复间距 */}
+        {!renderLabel &&
+          (data.icon ? (
+            <data.icon className="h-5 w-5 flex-shrink-0 text-muted-foreground" />
+          ) : (
+            <span className="w-5 flex-shrink-0" />
+          ))}
 
-        {/* Label area */}
-        {renderLabel ? (
-          <span className="flex-1 min-w-0 truncate" title={data.label}>
-            {renderLabel(data, state)}
-          </span>
-        ) : (
-          <span className="flex-1 min-w-0 truncate" title={data.label}>
-            {data.label}
-          </span>
-        )}
+        {/* Label area — 鼠标悬停时跟随光标显示全名浮窗 */}
+        <TreeLabelTip label={data.label}>
+          <span className="flex-1 min-w-0 truncate">{renderLabel ? renderLabel(data, state) : data.label}</span>
+        </TreeLabelTip>
 
         {/* Description */}
         {data.description && !renderLabel && (
@@ -535,6 +541,51 @@ export function TreeItemGroup({ children, className }: TreeItemGroupProps) {
 }
 
 // ---------------------------------------------------------------------------
+// TreeLabelTip — 鼠标悬停 0.4s 后弹出全名浮窗，位置固定，离开消失
+// ---------------------------------------------------------------------------
+
+function TreeLabelTip({ label, children }: { label: string; children: ReactNode }) {
+  const [visible, setVisible] = useState(false);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      if (!visible) {
+        // 浮窗未出现：记录最新鼠标位置，延时 0.4s 弹出
+        clearTimeout(timerRef.current);
+        const { clientX, clientY } = e;
+        timerRef.current = setTimeout(() => {
+          setPos({ x: clientX, y: clientY });
+          setVisible(true);
+        }, 400);
+      }
+      // 浮窗已出现：位置固定，不再更新
+    },
+    [visible],
+  );
+
+  const handleMouseLeave = useCallback(() => {
+    clearTimeout(timerRef.current);
+    setVisible(false);
+  }, []);
+
+  return (
+    <span className="flex-1 min-w-0" onMouseMove={handleMouseMove} onMouseLeave={handleMouseLeave}>
+      {children}
+      {visible && (
+        <span
+          className="fixed z-50 max-w-xs rounded-md border border-border bg-surface-1 px-2.5 py-1 text-xs text-text-primary shadow-md pointer-events-none break-all"
+          style={{ left: pos.x + 12, top: pos.y + 18 }}
+        >
+          {label}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // ShowMoreButton (internal)
 // ---------------------------------------------------------------------------
 
@@ -549,8 +600,8 @@ function ShowMoreButton({ remaining, onClick, depth }: ShowMoreButtonProps) {
   return (
     <button
       type="button"
-      className="flex items-center gap-1 h-7 px-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50 rounded-sm cursor-pointer w-full"
-      style={{ paddingLeft: `${(depth + 1) * 6}px` }}
+      className="flex items-center gap-1 h-8 pr-2 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50 rounded-sm cursor-pointer w-full"
+      style={{ paddingLeft: `${(depth + 1) * 12 + 8}px` }}
       onClick={onClick}
     >
       {t("tree.showMore", { count: remaining })}

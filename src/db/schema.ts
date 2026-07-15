@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
@@ -29,6 +30,8 @@ export const user = pgTable("user", {
   name: varchar("name").notNull(),
   email: varchar("email").notNull().unique(),
   emailVerified: boolean("email_verified").notNull().default(false),
+  phoneNumber: varchar("phone_number", { length: 32 }).unique(),
+  phoneNumberVerified: boolean("phone_number_verified").notNull().default(false),
   image: text("image"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -236,7 +239,9 @@ export const environment = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
-    orgNameIdx: uniqueIndex("idx_environment_org_name").on(table.organizationId, table.name),
+    orgUserAgentConfigIdx: uniqueIndex("idx_environment_org_user_agent_config")
+      .on(table.organizationId, table.userId, table.agentConfigId)
+      .where(sql`${table.agentConfigId} is not null`),
   }),
 );
 
@@ -269,7 +274,7 @@ export const knowledgeBase = pgTable(
     name: varchar("name").notNull(),
     slug: varchar("slug").notNull(),
     description: text("description"),
-    provider: varchar("provider").notNull().default("openviking"),
+    provider: varchar("provider").notNull().default("ragflow"),
     remoteId: varchar("remote_id"),
     remoteAccountId: varchar("remote_account_id"),
     remoteUserId: varchar("remote_user_id"),
@@ -366,9 +371,7 @@ export const scheduledTask = pgTable(
 // 任务执行日志表
 export const taskExecutionLog = pgTable("task_execution_log", {
   id: uuid("id").primaryKey().defaultRandom(),
-  taskId: uuid("task_id")
-    .notNull()
-    .references(() => scheduledTask.id, { onDelete: "cascade" }),
+  taskId: uuid("task_id").notNull(),
   status: varchar("status").notNull(),
   error: text("error"),
   duration: integer("duration"),
@@ -380,6 +383,40 @@ export const taskExecutionLog = pgTable("task_execution_log", {
   resultSummary: text("result_summary"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+// 定时任务表 v2（HTTP + Agent 双类型）。
+// 旧表 scheduled_task 保留不动，不提供迁移脚本。
+export const scheduledTaskV2 = pgTable(
+  "scheduled_task_v2",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    organizationId: text("organization_id").notNull(),
+    name: varchar("name").notNull(),
+    description: text("description"),
+    cron: varchar("cron").notNull(),
+    timezone: varchar("timezone"),
+    enabled: boolean("enabled").notNull().default(true),
+    timeoutSeconds: integer("timeout_seconds").notNull().default(300),
+    agentId: uuid("agent_id").references(() => agentConfig.id, { onDelete: "set null" }),
+    type: varchar("type").notNull(),
+    definition: jsonb("definition").notNull(),
+    lastRunAt: timestamp("last_run_at", { withTimezone: true }),
+    nextRunAt: timestamp("next_run_at", { withTimezone: true }),
+    lastStatus: varchar("last_status"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    orgIdx: index("idx_scheduled_task_v2_org_id").on(table.organizationId),
+    agentIdx: index("idx_scheduled_task_v2_agent_id").on(table.agentId),
+  }),
+);
+
+export type ScheduledTaskV2Row = typeof scheduledTaskV2.$inferSelect;
+export type ScheduledTaskV2Insert = typeof scheduledTaskV2.$inferInsert;
 
 // IMChannel 一等资源表（升级自 channel_binding）
 export const imChannel = pgTable(
@@ -515,6 +552,7 @@ export const agentConfig = pgTable(
     machineId: text("machine_id").references(() => machine.id, { onDelete: "set null" }),
     // 预留给未来可变扩展，避免为低频碎片配置反复加列。
     extra: jsonb("extra"),
+    engineType: varchar("engine_type", { length: 32 }).default("opencode"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -643,6 +681,28 @@ export const agentConfigMcp = pgTable(
   },
   (table) => ({
     pk: uniqueIndex("idx_agent_config_mcp_pk").on(table.agentConfigId, table.mcpServerId),
+  }),
+);
+
+// Agent↔SiteApp 多对多关联
+// 一个 Agent 配置可绑定多个 agent-sites 应用，绑定的 sites 会出现在 chat 右侧文件区的
+// 顶部 tab 中，与 Files 通过 tab 切换互斥展示。绑定层挂在 agentConfig 上，可被多个
+// environment 共享，与 skill/mcp 绑定层级一致。
+export const agentConfigSiteApp = pgTable(
+  "agent_config_site_app",
+  {
+    agentConfigId: uuid("agent_config_id")
+      .notNull()
+      .references(() => agentConfig.id, { onDelete: "cascade" }),
+    siteAppId: uuid("site_app_id")
+      .notNull()
+      .references(() => agentSiteApp.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    pk: uniqueIndex("idx_agent_config_site_app_pk").on(table.agentConfigId, table.siteAppId),
+    agentConfigIdx: index("idx_agent_config_site_app_agent_config").on(table.agentConfigId),
+    siteAppIdx: index("idx_agent_config_site_app_site_app").on(table.siteAppId),
   }),
 );
 
@@ -895,6 +955,7 @@ export const machine = pgTable(
     organizationId: text("organization_id"),
     userId: text("user_id"),
     agentName: varchar("agent_name").notNull(),
+    name: varchar("name"),
     status: varchar("status").default("online").notNull(),
     machineInfo: jsonb("machine_info"),
     labels: jsonb("labels"),
@@ -927,3 +988,67 @@ export const registryEvent = pgTable(
     typeIdx: index("idx_registry_event_type").on(table.type),
   }),
 );
+
+// ────────────────────────────────────────────
+// Agent Sites 代理 — app 映射与凭证
+// ────────────────────────────────────────────
+
+export const agentSiteApp = pgTable(
+  "agent_site_app",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: text("organization_id").notNull(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    remoteAppId: varchar("remote_app_id", { length: 64 }).notNull(),
+    name: varchar("name", { length: 32 }).notNull(),
+    description: text("description"),
+    platformToken: text("platform_token").notNull(),
+    platformTokenId: varchar("platform_token_id", { length: 64 }).notNull(),
+    visibility: varchar("visibility", { length: 20 }).notNull().default("private"),
+    // ── custom app 部署相关 ──
+    // appType 为判别字段：'pocketbase' 时下方三个字段保持 null；
+    // 'custom' 时 entryFile 指定入口文件（如 'main.ts'），activeSlot 为蓝绿部署槽（'a'/'b'），
+    // deployedAt 记录最后一次部署时间。
+    appType: varchar("app_type", { length: 20 }).notNull().default("pocketbase"),
+    entryFile: varchar("entry_file", { length: 64 }),
+    activeSlot: varchar("active_slot", { length: 8 }),
+    deployedAt: timestamp("deployed_at", { withTimezone: true }),
+    /** 创建此 site 的 agent_config id。ON DELETE SET NULL：创建者被删除时放空，兜底放开所有绑定 agent 的修改权限。 */
+    createdByAgentConfigId: uuid("created_by_agent_config_id").references(() => agentConfig.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    remoteAppIdIdx: uniqueIndex("idx_agent_site_app_remote_app_id").on(table.remoteAppId),
+    orgVisibilityIdx: index("idx_agent_site_app_org_visibility").on(table.organizationId, table.visibility),
+    orgIdx: index("idx_agent_site_app_org").on(table.organizationId),
+    userIdx: index("idx_agent_site_app_user").on(table.userId),
+  }),
+);
+
+// ProdView 智能体发布视图
+export const prodView = pgTable(
+  "prod_view",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: text("organization_id").notNull(),
+    name: varchar("name").notNull(),
+    description: text("description"),
+    agentId: uuid("agent_id")
+      .notNull()
+      .references(() => agentConfig.id, { onDelete: "cascade" }),
+    modulesConfig: jsonb("modules_config").notNull().default(sql`'{}'`),
+    enabled: boolean("enabled").notNull().default(true),
+    createdBy: text("created_by").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("idx_prod_view_org_id").on(t.organizationId), index("idx_prod_view_agent_id").on(t.agentId)],
+);
+
+export type ProdViewRow = typeof prodView.$inferSelect;
+export type ProdViewInsert = typeof prodView.$inferInsert;

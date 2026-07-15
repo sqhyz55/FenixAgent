@@ -53,25 +53,6 @@ export interface CreateSessionRequest {
   username?: string;
 }
 
-export interface CreateCodeSessionRequest {
-  title?: string;
-  source?: string;
-  username?: string;
-}
-
-export interface WorkResponse {
-  id: string;
-  type: string;
-  environment_id: string;
-  state: string;
-  data: {
-    type: string;
-    id: string;
-  };
-  secret: string;
-  created_at: string;
-}
-
 export interface AutomationStateResponse {
   enabled: boolean;
   phase: "standby" | "sleeping" | null;
@@ -94,14 +75,14 @@ export interface RegisterEnvironmentWebRequest {
   name: string;
   description?: string;
   workspacePath: string;
-  agentConfigId?: string;
+  agentConfigId: string;
 }
 
 export interface UpdateEnvironmentWebRequest {
   name?: string;
   description?: string;
   workspacePath?: string;
-  agentConfigId?: string | null;
+  agentConfigId?: string;
 }
 
 export interface EnvironmentWebResponse {

@@ -3,6 +3,10 @@ export interface ParamDef {
   type?: "string" | "number" | "boolean" | "object";
   default?: unknown;
   required?: boolean;
+  /** 参数分组标识（可选）。前端 RunParamsDialog 据此分组渲染。
+   *  - 未设: 归入默认组（顶部，始终展开）
+   *  - "advance": 高级组（底部，默认折叠）*/
+  group?: string;
 }
 
 /** 重试配置 */
@@ -15,7 +19,17 @@ export interface RetryConfig {
 }
 
 /** 节点类型 */
-export type NodeType = "shell" | "python" | "agent" | "api" | "audit" | "workflow" | "loop" | "transform";
+export type NodeType =
+  | "shell"
+  | "python"
+  | "agent"
+  | "api"
+  | "audit"
+  | "workflow"
+  | "loop"
+  | "transform"
+  | "custom"
+  | "end";
 
 /** 基础节点定义 */
 export interface BaseNodeDef {
@@ -28,6 +42,18 @@ export interface BaseNodeDef {
   timeout?: number;
   retry?: RetryConfig;
   env?: Record<string, string>;
+  /**
+   * 输出声明。所有节点类型都可声明，key 为字段名。
+   * dag-scheduler 在节点完成后求值 pattern（${{ params.xxx }} / ${{ nodes.Y.output.z }}），
+   * 把求值结果（路径字符串）merge 到 NodeOutput.json，下游通过 ${{ nodes.X.output.<key> }} 引用。
+   */
+  outputs?: Record<
+    string,
+    {
+      pattern: string;
+      type: "file" | "file-list" | "dir";
+    }
+  >;
 }
 
 /** Shell 节点 — 执行命令 */
@@ -107,6 +133,70 @@ export interface TransformNodeDef extends BaseNodeDef {
   output: Record<string, string>;
 }
 
+/** Custom 节点 — 用户自定义工具，通过 tools/ 文件夹注册 */
+export interface CustomNodeDef extends BaseNodeDef {
+  type: "custom";
+  /** 对应 CustomNode.name，从 CustomNodeRegistry 查找 */
+  tool: string;
+  /** 输入绑定，key 对应 CustomNode.inputs 的 key，value 为表达式字符串 */
+  inputs?: Record<string, string>;
+  /**
+   * Slurm 资源声明（仅当 tool 是 SlurmNode 子类时生效，如通用 slurm 工具）。
+   * 字段会注入到 ExecuteContext.slurm，由 SlurmNode 合并到默认 slurmConfig。
+   * 不声明则使用工具自带的默认资源。
+   */
+  slurm?: {
+    partition?: string;
+    cores?: number;
+    nodes?: number;
+    memory?: string;
+    walltime?: string;
+    modules?: string[];
+    jobName?: string;
+    extraSBATCH?: string[];
+  };
+  /**
+   * Slurm 脚本声明(仅当 tool 是 SlurmNode 子类时生效)。
+   * 由 parseScriptConfig 解析,dag-scheduler 求值 ${{ }} 表达式后注入 ExecuteContext.script。
+   * SlurmNode 子类必须声明此字段(parseNode 校验),非 Slurm 工具禁止声明。
+   */
+  script?: {
+    content: string;
+    env?: Record<string, string>;
+  };
+  /**
+   * Custom 节点的 outputs（继承自 BaseNodeDef）优先由 tool 注册时的 produces 驱动；
+   * YAML 中声明的 outputs 可作为覆盖或补充。custom-executor 会校验 outputs key
+   * 必须在 tool.produces 列表中（除非 produces 含 "*"）。
+   */
+  /** 迭代数据源表达式 */
+  foreach?: string;
+  /** 最大并发子任务数 */
+  maxConcurrent?: number;
+  /** 子任务失败是否继续，默认 false */
+  continueOnError?: boolean;
+}
+
+/** end 节点 — 声明式最终输出收集器。
+ *
+ * 不执行外部操作，仅在所有 depends_on 节点完成后对 inputs 做模板求值。
+ * 同一 DAG 最多一个 end 节点，校验阶段强制。 */
+export interface EndNodeDef {
+  type: "end";
+  id: string;
+  description?: string;
+  /** depends_on 在根级 end 节点中为必填（校验阶段强制），此处可选以与 BaseNodeDef 兼容 */
+  depends_on?: string[];
+  condition?: string;
+  timeout?: number;
+  retry?: RetryConfig;
+  /** 声明式收集最终输出字段，key→${{ }} 模板表达式 */
+  inputs?: Record<string, string>;
+  /** 输出声明，与 BaseNodeDef 保持兼容 */
+  outputs?: Record<string, { pattern: string; type: "file" | "file-list" | "dir" }>;
+  env?: Record<string, string>;
+}
+
 /** 节点定义判别联合 */
 export type NodeDef =
   | ShellNodeDef
@@ -116,7 +206,9 @@ export type NodeDef =
   | AuditNodeDef
   | SubWorkflowNodeDef
   | LoopNodeDef
-  | TransformNodeDef;
+  | TransformNodeDef
+  | CustomNodeDef
+  | EndNodeDef;
 
 /** WorkflowDef — YAML 根结构 */
 export interface WorkflowDef {

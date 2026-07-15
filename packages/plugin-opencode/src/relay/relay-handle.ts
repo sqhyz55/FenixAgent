@@ -25,8 +25,7 @@ export interface CreateRelayHandleInput {
 
 export interface OpencodeRelayHandle extends EngineRelayHandle {
   readonly url: string;
-  readonly ready: Promise<void>;
-  onMessage(listener: (message: EngineRelayMessage) => void): () => void;
+  // onMessage/ready 已在 EngineRelayHandle 中声明为可选，此处不再重复声明
 }
 
 const KEEPALIVE_TYPE = "keep_alive";
@@ -132,11 +131,8 @@ export function createRelayHandle(
       try {
         const parsed = JSON.parse(line);
         if (!shouldIgnoreInbound(parsed)) {
-          console.log(
-            `[RelayHandle] Inbound ← acp-link (${input.instanceId}): type=${parsed.type}${hasListeners ? "" : " (buffered)"}`,
-          );
+          emit(parsed);
         }
-        emit(parsed);
       } catch {
         // Ignore malformed relay frames from local acp-link.
       }
@@ -192,7 +188,6 @@ export function createRelayHandle(
         emit({ type: PONG_TYPE });
         return;
       }
-      console.log(`[RelayHandle] Outbound → acp-link (${input.instanceId}): type=${message.type}`);
       socket.send(JSON.stringify(message));
     },
     close(code, reason) {

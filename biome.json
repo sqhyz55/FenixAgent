@@ -59,6 +59,7 @@
       "!!**/drizzle",
       "!!**/.agents",
       "!!**/coverage",
+      "!!**/docs",
       "!!**/routeTree.gen.ts"
     ],
     "ignoreUnknown": true
@@ -69,7 +70,19 @@
       "linter": {
         "rules": {
           "suspicious": {
-            "noExplicitAny": "off"
+            "noExplicitAny": "off",
+            "noTemplateCurlyInString": "off"
+          },
+          "correctness": {
+            "noUnusedImports": "warn",
+            "noUnusedFunctionParameters": "warn",
+            "noUnusedVariables": "warn"
+          },
+          "style": {
+            "useImportType": "off"
+          },
+          "complexity": {
+            "useOptionalChain": "off"
           }
         }
       }

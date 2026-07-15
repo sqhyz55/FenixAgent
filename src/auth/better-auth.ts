@@ -1,9 +1,11 @@
 import { apiKey } from "@better-auth/api-key";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { phoneNumber } from "better-auth/plugins";
 import { organization } from "better-auth/plugins/organization";
 import { db } from "../db";
 import * as schema from "../db/schema";
+import { normalizeChineseMainlandPhoneNumber } from "../services/phone-number";
 import { buildTrustedOrigins } from "./trusted-origins";
 
 function generateId(size = 32): string {
@@ -12,6 +14,8 @@ function generateId(size = 32): string {
 }
 
 export const auth = betterAuth({
+  // baseURL 用于生成回调/重定向 URL。线上必须通过 BETTER_AUTH_URL 环境变量设置。
+  baseURL: process.env.BETTER_AUTH_URL,
   database: drizzleAdapter(db, {
     provider: "pg",
     schema,
@@ -33,9 +37,25 @@ export const auth = betterAuth({
       allowUserToCreateOrganization: true,
       membershipLimit: 100,
     }),
+    phoneNumber({
+      sendOTP: async () => {},
+      phoneNumberValidator: async (value) => {
+        try {
+          normalizeChineseMainlandPhoneNumber(value);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    }),
     apiKey({
       defaultPrefix: "rcs_",
       enableMetadata: true,
+      // 平台 API key 主要用于 External API / ACP relay，这类调用会高频校验；
+      // better-auth 默认 10 次/天的限流过于激进，因此统一在服务端配置层关闭。
+      rateLimit: {
+        enabled: false,
+      },
     }),
   ],
   databaseHooks: {

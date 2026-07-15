@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import Elysia from "elysia";
 import { NotFoundError } from "../../errors";
 import { authGuardPlugin } from "../../plugins/auth";
+import { WebErrSchema } from "../../schemas/common.schema";
 import {
   BatchDeleteRequestSchema,
   BatchDeleteResponseSchema,
@@ -22,6 +23,7 @@ import {
 } from "../../services/remote-file-service";
 import {
   deleteFile,
+  deleteNode,
   isUserPath,
   listPathsRecursive,
   mkdirp,
@@ -40,12 +42,17 @@ const app = new Elysia({ name: "web-user-file", prefix: "/environments" }).use(a
   "batch-delete-response": BatchDeleteResponseSchema,
 });
 
-async function requireEnv(envId: string, orgId: string, errorFn: (status: number, body: unknown) => Response) {
+async function requireEnv(
+  envId: string,
+  orgId: string,
+  userId: string,
+  errorFn: (status: number, body: unknown) => Response,
+) {
   try {
-    return await getOwnedEnvironment(envId, orgId);
+    return await getOwnedEnvironment(envId, orgId, userId);
   } catch (e) {
     if (e instanceof NotFoundError) {
-      return errorFn(404, { error: { type: "not_found", message: "环境不存在" } });
+      return errorFn(404, { success: false, error: { code: "not_found", message: "环境不存在" } });
     }
     throw e;
   }
@@ -54,41 +61,57 @@ async function requireEnv(envId: string, orgId: string, errorFn: (status: number
 // GET /:id/user-file/tree — 递归列出 user/ 下所有路径
 app.get(
   "/:id/user-file/tree",
-  async ({ store, params, error }) => {
+  // biome-ignore lint/suspicious/noExplicitAny: Elysia 在 response schema + error 分支组合下类型推断不稳定
+  async ({ store, params, error }: any) => {
     const authCtx = store.authContext!;
-    const env = await requireEnv(params.id, authCtx.organizationId, error);
+    const user = store.user!;
+    const env = await requireEnv(params.id, authCtx.organizationId, user.id, error);
     if (env instanceof Response) return env;
 
     const machineId = await getRemoteMachineId(params.id);
     if (machineId) {
       try {
-        const paths = await remoteTree(machineId, params.id);
-        return { paths };
+        const { paths, mtimes, errors } = await remoteTree(machineId, params.id);
+        return { success: true as const, data: { paths, mtimes, errors } };
       } catch (e) {
         const message = e instanceof Error ? e.message : "Remote tree operation failed";
-        return error(503, { error: { type: "remote_error", message } });
+        return error(503, { success: false, error: { code: "remote_error", message } });
       }
     }
 
     const resolved = await resolveWorkspacePath(params.id, ".");
-    if (!resolved) return error(404, { error: { type: "not_found", message: "工作区不存在" } });
-    const entries = await listPathsRecursive(resolved.workspaceDir);
+    if (!resolved) return error(404, { success: false, error: { code: "not_found", message: "工作区不存在" } });
+    const { entries, errors } = await listPathsRecursive(resolved.workspaceDir);
     const paths = entries.map((e) => e.path);
     const mtimes: Record<string, number> = {};
     for (const e of entries) {
       if (e.mtime > 0) mtimes[e.path] = e.mtime;
     }
-    return { paths, mtimes };
+    return { success: true as const, data: { paths, mtimes, errors: errors.length > 0 ? errors : undefined } };
   },
-  { sessionAuth: true },
+  {
+    sessionAuth: true,
+    response: {
+      200: "tree-response",
+      404: WebErrSchema,
+      503: WebErrSchema,
+    },
+    detail: {
+      tags: ["Files"],
+      summary: "获取文件树",
+      description: "递归返回指定环境 user 目录下的文件与目录路径，用于构建完整文件树。",
+    },
+  },
 );
 
 // POST /:id/user-file/rename — 重命名/移动文件或目录
 app.post(
   "/:id/user-file/rename",
-  async ({ store, params, body, error }) => {
+  // biome-ignore lint/suspicious/noExplicitAny: Elysia 在 response schema + error 分支组合下类型推断不稳定
+  async ({ store, params, body, error }: any) => {
     const authCtx = store.authContext!;
-    await requireEnv(params.id, authCtx.organizationId, error);
+    const user = store.user!;
+    await requireEnv(params.id, authCtx.organizationId, user.id, error);
     const { oldPath, newPath } = body as { oldPath: string; newPath: string };
 
     const machineId = await getRemoteMachineId(params.id);
@@ -96,41 +119,61 @@ app.post(
       // 远程节点支持 workspace 全路径
       try {
         await remoteRename(machineId, params.id, oldPath, newPath);
-        return { oldPath, newPath };
+        return { success: true as const, data: { oldPath, newPath } };
       } catch (e) {
         const message = e instanceof Error ? e.message : "Remote rename operation failed";
-        return error(503, { error: { type: "remote_error", message } });
+        return error(503, { success: false, error: { code: "remote_error", message } });
       }
     }
 
     if (!isUserPath(oldPath) || !isUserPath(newPath)) {
-      return error(400, { error: { type: "validation_error", message: "Only user/ paths are allowed" } });
+      return error(400, {
+        success: false,
+        error: { code: "validation_error", message: "Only user/ paths are allowed" },
+      });
     }
 
     const oldResolved = await resolveWorkspacePath(params.id, oldPath);
-    if (!oldResolved) return error(404, { error: { type: "not_found", message: "Source not found" } });
+    if (!oldResolved) return error(404, { success: false, error: { code: "not_found", message: "Source not found" } });
 
     try {
       await stat(oldResolved.resolved);
     } catch {
-      return error(404, { error: { type: "not_found", message: "Source not found" } });
+      return error(404, { success: false, error: { code: "not_found", message: "Source not found" } });
     }
 
     const newResolved = await resolveWorkspacePath(params.id, newPath);
-    if (!newResolved) return error(400, { error: { type: "validation_error", message: "Invalid destination" } });
+    if (!newResolved)
+      return error(400, { success: false, error: { code: "validation_error", message: "Invalid destination" } });
 
     await renamePath(oldResolved.resolved, newResolved.resolved);
-    return { oldPath, newPath };
+    return { success: true as const, data: { oldPath, newPath } };
   },
-  { sessionAuth: true, body: "rename-request" },
+  {
+    sessionAuth: true,
+    body: "rename-request",
+    response: {
+      200: "rename-response",
+      400: WebErrSchema,
+      404: WebErrSchema,
+      503: WebErrSchema,
+    },
+    detail: {
+      tags: ["Files"],
+      summary: "重命名文件或目录",
+      description: "重命名或移动 user 目录中的文件或目录，保留原有工作区路径语义。",
+    },
+  },
 );
 
 // POST /:id/user-file/mkdir — 创建目录
 app.post(
   "/:id/user-file/mkdir",
-  async ({ store, params, body, error }) => {
+  // biome-ignore lint/suspicious/noExplicitAny: Elysia 在 response schema + error 分支组合下类型推断不稳定
+  async ({ store, params, body, error }: any) => {
     const authCtx = store.authContext!;
-    await requireEnv(params.id, authCtx.organizationId, error);
+    const user = store.user!;
+    await requireEnv(params.id, authCtx.organizationId, user.id, error);
     const { path } = body as { path: string };
 
     const machineId = await getRemoteMachineId(params.id);
@@ -138,32 +181,51 @@ app.post(
       // 远程节点支持 workspace 全路径
       try {
         await remoteMkdir(machineId, params.id, path);
-        return { path };
+        return { success: true as const, data: { path } };
       } catch (e) {
         const message = e instanceof Error ? e.message : "Remote mkdir operation failed";
-        return error(503, { error: { type: "remote_error", message } });
+        return error(503, { success: false, error: { code: "remote_error", message } });
       }
     }
 
     if (!isUserPath(path)) {
-      return error(400, { error: { type: "validation_error", message: "Only user/ paths are allowed" } });
+      return error(400, {
+        success: false,
+        error: { code: "validation_error", message: "Only user/ paths are allowed" },
+      });
     }
 
     const resolved = await resolveWorkspacePath(params.id, path);
-    if (!resolved) return error(400, { error: { type: "validation_error", message: "Invalid path" } });
+    if (!resolved) return error(400, { success: false, error: { code: "validation_error", message: "Invalid path" } });
 
     await mkdirp(resolved.resolved);
-    return { path };
+    return { success: true as const, data: { path } };
   },
-  { sessionAuth: true, body: "mkdir-request" },
+  {
+    sessionAuth: true,
+    body: "mkdir-request",
+    response: {
+      200: "mkdir-response",
+      400: WebErrSchema,
+      404: WebErrSchema,
+      503: WebErrSchema,
+    },
+    detail: {
+      tags: ["Files"],
+      summary: "创建目录",
+      description: "在指定环境的 user 目录下创建新目录。",
+    },
+  },
 );
 
 // DELETE /:id/user-file/batch — 批量删除
 app.delete(
   "/:id/user-file/batch",
-  async ({ store, params, body, error }) => {
+  // biome-ignore lint/suspicious/noExplicitAny: Elysia 在 response schema + error 分支组合下类型推断不稳定
+  async ({ store, params, body, error }: any) => {
     const authCtx = store.authContext!;
-    await requireEnv(params.id, authCtx.organizationId, error);
+    const user = store.user!;
+    await requireEnv(params.id, authCtx.organizationId, user.id, error);
     const { paths } = body as { paths: string[] };
 
     const machineId = await getRemoteMachineId(params.id);
@@ -179,7 +241,7 @@ app.delete(
           failed.push({ path: p, error: e instanceof Error ? e.message : "Unknown error" });
         }
       }
-      return { deleted, failed };
+      return { success: true as const, data: { deleted, failed } };
     }
 
     const deleted: string[] = [];
@@ -200,19 +262,31 @@ app.delete(
         }
         const info = await stat(resolved.resolved);
         if (info.isDirectory()) {
-          failed.push({ path: fullPath, error: "Cannot delete directories" });
-          continue;
+          await deleteNode(resolved.resolved);
+        } else {
+          await deleteFile(resolved.resolved);
         }
-        await deleteFile(resolved.resolved);
         deleted.push(fullPath);
       } catch (e) {
         failed.push({ path: fullPath, error: e instanceof Error ? e.message : "Unknown error" });
       }
     }
 
-    return { deleted, failed };
+    return { success: true as const, data: { deleted, failed } };
   },
-  { sessionAuth: true, body: "batch-delete-request" },
+  {
+    sessionAuth: true,
+    body: "batch-delete-request",
+    response: {
+      200: "batch-delete-response",
+      404: WebErrSchema,
+    },
+    detail: {
+      tags: ["Files"],
+      summary: "批量删除文件或目录",
+      description: "批量删除指定路径的文件或目录（目录将递归删除），并分别返回成功与失败结果。",
+    },
+  },
 );
 
 // GET /:id/user-file/download-zip — 打包下载目录为 zip
@@ -220,30 +294,39 @@ app.get(
   "/:id/user-file/download-zip",
   async ({ store, params, query, error, set }) => {
     const authCtx = store.authContext!;
-    const env = await requireEnv(params.id, authCtx.organizationId, error);
+    const user = store.user!;
+    const env = await requireEnv(params.id, authCtx.organizationId, user.id, error);
     if (env instanceof Response) return env;
 
     const machineId = await getRemoteMachineId(params.id);
     if (machineId) {
       return error(501, {
-        error: { type: "not_implemented", message: "远程环境暂不支持目录打包下载" },
+        success: false,
+        error: { code: "not_implemented", message: "远程环境暂不支持目录打包下载" },
       });
     }
 
     const path = (query as Record<string, string | undefined>)?.path;
-    if (!path) return error(400, { error: { type: "validation_error", message: "path query parameter required" } });
+    if (!path)
+      return error(400, {
+        success: false,
+        error: { code: "validation_error", message: "path query parameter required" },
+      });
     if (!isUserPath(path))
-      return error(400, { error: { type: "validation_error", message: "Only user/ paths are allowed" } });
+      return error(400, {
+        success: false,
+        error: { code: "validation_error", message: "Only user/ paths are allowed" },
+      });
 
     const resolved = await resolveWorkspacePath(params.id, path);
-    if (!resolved) return error(404, { error: { type: "not_found", message: "Path not found" } });
+    if (!resolved) return error(404, { success: false, error: { code: "not_found", message: "Path not found" } });
 
     try {
       const info = await stat(resolved.resolved);
       if (!info.isDirectory())
-        return error(400, { error: { type: "validation_error", message: "Path is not a directory" } });
+        return error(400, { success: false, error: { code: "validation_error", message: "Path is not a directory" } });
     } catch {
-      return error(404, { error: { type: "not_found", message: "Path not found" } });
+      return error(404, { success: false, error: { code: "not_found", message: "Path not found" } });
     }
 
     const dirName = path.split("/").filter(Boolean).pop() || "download";
@@ -259,7 +342,14 @@ app.get(
     // biome-ignore lint/suspicious/noExplicitAny: ReadableStream type mismatch
     return new Response(zipProcess.stdout as any);
   },
-  { sessionAuth: true },
+  {
+    sessionAuth: true,
+    detail: {
+      tags: ["Files"],
+      summary: "下载目录压缩包",
+      description: "将指定 user 目录打包为 zip 文件并直接返回下载流；当前仅支持本地环境。",
+    },
+  },
 );
 
 export default app;

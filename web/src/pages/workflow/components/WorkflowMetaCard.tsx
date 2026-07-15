@@ -1,5 +1,7 @@
 import { useTranslation } from "react-i18next";
+import { Textarea } from "@/components/ui/textarea";
 import type { WfMeta } from "../yaml-utils";
+import { ParamsEditor } from "./ParamsEditor";
 
 export interface WorkflowMetaCardProps {
   readOnly: boolean;
@@ -12,19 +14,20 @@ export function WorkflowMetaCard({ readOnly, meta, updateMeta }: WorkflowMetaCar
 
   return (
     <div className="wf-popover-body">
+      {/* 基本信息 */}
       <div className="wf-prop-section">
         <div className="wf-prop-section-title">{t("editor.basic_info")}</div>
-        <div className="wf-prop-field">
+        <div className="wf-prop-field-inline">
           <label>{t("editor.schema_version")}</label>
           <input value={meta.schema_version} readOnly />
         </div>
-        <div className="wf-prop-field">
+        <div className="wf-prop-field-inline">
           <label>{t("editor.name")}</label>
           <input value={meta.name} onChange={(e) => updateMeta({ name: e.target.value })} readOnly={readOnly} />
         </div>
-        <div className="wf-prop-field">
+        <div className="wf-prop-field-block">
           <label>{t("editor.meta_description")}</label>
-          <textarea
+          <Textarea
             value={meta.description}
             onChange={(e) => updateMeta({ description: e.target.value })}
             placeholder={t("editor.meta_desc_placeholder")}
@@ -32,7 +35,7 @@ export function WorkflowMetaCard({ readOnly, meta, updateMeta }: WorkflowMetaCar
             readOnly={readOnly}
           />
         </div>
-        <div className="wf-prop-field">
+        <div className="wf-prop-field-inline">
           <label>{t("editor.timeout_seconds")}</label>
           <input
             type="number"
@@ -44,39 +47,30 @@ export function WorkflowMetaCard({ readOnly, meta, updateMeta }: WorkflowMetaCar
         </div>
       </div>
 
+      {/* 参数 */}
       <div className="wf-prop-section">
         <div className="wf-prop-section-title">{t("editor.params")}</div>
-        <div className="wf-prop-field">
-          <label>{t("editor.params_json")}</label>
-          <textarea
-            value={Object.keys(meta.params).length ? JSON.stringify(meta.params, null, 2) : ""}
-            onChange={(e) => {
-              try {
-                const parsed = e.target.value.trim() ? JSON.parse(e.target.value) : {};
-                updateMeta({ params: parsed });
-              } catch {
-                // 用户还在编辑，暂不更新
-              }
-            }}
-            placeholder='{"name": {"type": "string", "default": "World"}}'
-            rows={3}
-            readOnly={readOnly}
-          />
-        </div>
+        <ParamsEditor
+          value={meta.params}
+          onChange={(val) => updateMeta({ params: val ?? {} })}
+          readOnly={readOnly}
+          namePlaceholder={t("editor.params_name_placeholder")}
+          defaultPlaceholder={t("editor.params_default_placeholder")}
+          addLabel={t("editor.params_add")}
+        />
       </div>
 
+      {/* Secrets */}
       <div className="wf-prop-section">
         <div className="wf-prop-section-title">{t("editor.secrets")}</div>
-        <div className="wf-prop-field">
+        <div className="wf-prop-field-block">
           <label>{t("editor.secrets_env_names")}</label>
-          <textarea
+          <Textarea
             value={meta.secrets.join("\n")}
             onChange={(e) =>
               updateMeta({
-                secrets: e.target.value
-                  .split("\n")
-                  .map((s) => s.trim())
-                  .filter(Boolean),
+                // 保留空行以便用户编辑时换行，存 YAML 时在 yaml-utils 中过滤空行
+                secrets: e.target.value.split("\n").map((s) => s.trim()),
               })
             }
             placeholder="API_KEY&#10;DATABASE_URL"

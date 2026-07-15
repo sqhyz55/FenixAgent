@@ -1,4 +1,5 @@
 import type * as acp from "@agentclientprotocol/sdk";
+import { extractModelState, extractModeState } from "./config-options-utils.js";
 import {
   ACP_METHOD,
   createErrorResponse,
@@ -58,15 +59,39 @@ function cancelPendingPermissions(state: AcpSessionState): void {
  * 通过 send 回调返回 JSON-RPC 响应/通知。
  * server mode 和 client mode 的 relay 共用此逻辑。
  */
+export interface AcpDispatcherOptions {
+  send: (message: unknown) => void;
+  workspace?: string;
+  /** 处理来自前端的 control_response / permission_response */
+  onControlResponse?: (requestId: string, approved: boolean, extra?: Record<string, unknown>) => void;
+  /**
+   * 处理来自前端的权限响应 outcome，用于 opencode/ccb 的 requestPermission 回调。
+   * 前端 respondToPermission 发送的 JSON-RPC 响应会被解析为 outcome 对象，
+   * 然后通过此回调路由回 spawnAcpAgent 中 requestPermission 的待决 Promise。
+   */
+  onPermissionOutcome?: (
+    requestId: string,
+    outcome: { outcome: "cancelled" } | { outcome: "selected"; optionId: string },
+  ) => boolean;
+}
+
 export class AcpDispatcher {
   private workspace: string;
+  private send: (message: unknown) => void;
+  private onControlResponse?: (requestId: string, approved: boolean, extra?: Record<string, unknown>) => void;
+  private onPermissionOutcome?: (
+    requestId: string,
+    outcome: { outcome: "cancelled" } | { outcome: "selected"; optionId: string },
+  ) => boolean;
 
   constructor(
     private state: AcpSessionState,
-    private send: (message: unknown) => void,
-    workspace?: string,
+    options: AcpDispatcherOptions,
   ) {
-    this.workspace = workspace ?? process.cwd();
+    this.send = options.send;
+    this.workspace = options.workspace ?? process.cwd();
+    this.onControlResponse = options.onControlResponse;
+    this.onPermissionOutcome = options.onPermissionOutcome;
   }
 
   /** 处理从 WS 收到的原始消息（可能是 JSON-RPC 或传输层消息） */
@@ -81,6 +106,35 @@ export class AcpDispatcher {
     if ((msg as { jsonrpc?: string }).jsonrpc === "2.0" && msg.method && msg.id !== undefined) {
       console.log("[acp-dispatcher] ← rpc:", JSON.stringify(raw).slice(0, 500));
       await this.handleRequest(msg as unknown as JsonRpcRequest);
+      return;
+    }
+
+    // 处理来自前端的 JSON-RPC 响应（如 permission_response）
+    if ((msg as { jsonrpc?: string }).jsonrpc === "2.0" && msg.result && msg.id !== undefined) {
+      const respId = msg.id as string;
+      if (respId.startsWith("perm_")) {
+        const result = msg.result as Record<string, unknown>;
+        const rawOutcome = (result?.outcome as Record<string, unknown>) ?? {};
+        // outcome.outcome === "selected" 只表示用户选择了某个选项，
+        // 需要根据 optionId 判断究竟是 allow 还是 reject
+        const optionId = (rawOutcome.optionId as string) ?? "";
+        const selected = rawOutcome.outcome === "selected";
+        const approved = selected && (optionId.startsWith("allow_") || optionId === "allow");
+
+        // 1. canUseTool 路径（claude-acp-adapter）
+        if (this.onControlResponse) {
+          this.onControlResponse(respId, approved, result);
+        }
+
+        // 2. requestPermission 路径（opencode/ccb 的 spawnAcpAgent）
+        if (this.onPermissionOutcome) {
+          const typedOutcome: { outcome: "cancelled" } | { outcome: "selected"; optionId: string } = selected
+            ? { outcome: "selected", optionId }
+            : { outcome: "cancelled" };
+          this.onPermissionOutcome(respId, typedOutcome);
+        }
+      }
+      return;
     }
   }
 
@@ -104,6 +158,27 @@ export class AcpDispatcher {
       case "ping":
         this.send({ type: "pong" });
         break;
+      case "control_response":
+      case "permission_response": {
+        const requestId = (msg.request_id as string) ?? "";
+        const approved = (msg.approved as boolean) ?? false;
+        const extra = (msg.extra ?? msg.payload ?? {}) as Record<string, unknown>;
+        if (this.onControlResponse && requestId) {
+          this.onControlResponse(requestId, approved, extra);
+        }
+        break;
+      }
+      case "cancel_pending_permissions": {
+        // 前端 relay 全部断开时，主服务通过 relay handle 发送此消息，
+        // 通知 dispatcher 立即取消所有待决权限请求。
+        cancelPendingPermissions(this.state);
+        if (this.onPermissionOutcome) {
+          // "__cancel_all__" 哨兵 requestId 告诉 spawnAcpAgent
+          // 的 resolvePermissionOutcome 批量取消所有 pending 权限请求。
+          this.onPermissionOutcome("__cancel_all__", { outcome: "cancelled" });
+        }
+        break;
+      }
     }
   }
 
@@ -136,6 +211,12 @@ export class AcpDispatcher {
         case ACP_METHOD.SESSION_RESUME:
           await this.handleResumeSession(id, params as { sessionId: string; cwd?: string });
           break;
+        case ACP_METHOD.SESSION_DELETE:
+          await this.handleDeleteSession(id, params as { sessionId: string });
+          break;
+        case ACP_METHOD.SESSION_RENAME:
+          await this.handleRenameSession(id, params as { sessionId: string; title: string });
+          break;
         default:
           this.send(createErrorResponse(id, -32601, `Method not found: ${method}`));
       }
@@ -167,10 +248,11 @@ export class AcpDispatcher {
         mcpServers: [],
       });
       this.state.sessionId = result.sessionId;
-      this.state.modelState = result.models ?? null;
-      this.state.modeState = result.modes ?? null;
+      this.state.modelState = extractModelState(result.configOptions);
+      this.state.modeState = result.modes ?? extractModeState(result.configOptions);
       this.send(
         createSuccessResponse(id, {
+          ...result,
           sessionId: result.sessionId,
           promptCapabilities: this.state.promptCapabilities,
           models: this.state.modelState,
@@ -232,9 +314,10 @@ export class AcpDispatcher {
       return;
     }
     try {
-      await this.state.connection.unstable_setSessionModel({
+      await this.state.connection.setSessionConfigOption?.({
         sessionId: this.state.sessionId,
-        modelId: params.modelId,
+        configId: "model",
+        value: params.modelId,
       });
       this.state.modelState = { ...this.state.modelState, currentModelId: params.modelId };
       this.send(createSuccessResponse(id, { modelId: params.modelId }));
@@ -287,11 +370,7 @@ export class AcpDispatcher {
       this.send(
         createSuccessResponse(id, {
           sessions: sessions.map((s: acp.SessionInfo) => ({
-            _meta: s._meta,
-            cwd: s.cwd,
-            sessionId: s.sessionId,
-            title: s.title,
-            updatedAt: s.updatedAt,
+            ...s,
           })),
           nextCursor: result.nextCursor,
           _meta: result._meta,
@@ -318,10 +397,11 @@ export class AcpDispatcher {
         mcpServers: [],
       });
       this.state.sessionId = params.sessionId;
-      this.state.modelState = result.models ?? null;
-      this.state.modeState = result.modes ?? null;
+      this.state.modelState = extractModelState(result.configOptions);
+      this.state.modeState = result.modes ?? extractModeState(result.configOptions);
       this.send(
         createSuccessResponse(id, {
+          ...result,
           sessionId: params.sessionId,
           promptCapabilities: this.state.promptCapabilities,
           models: this.state.modelState,
@@ -349,10 +429,11 @@ export class AcpDispatcher {
         cwd: this.workspace,
       });
       this.state.sessionId = params.sessionId;
-      this.state.modelState = result.models ?? null;
-      this.state.modeState = result.modes ?? null;
+      this.state.modelState = extractModelState(result.configOptions);
+      this.state.modeState = result.modes ?? extractModeState(result.configOptions);
       this.send(
         createSuccessResponse(id, {
+          ...result,
           sessionId: params.sessionId,
           promptCapabilities: this.state.promptCapabilities,
           models: this.state.modelState,
@@ -362,5 +443,24 @@ export class AcpDispatcher {
     } catch (error) {
       this.send(createErrorResponse(id, -32603, `Failed to resume session: ${(error as Error).message}`));
     }
+  }
+
+  private async handleDeleteSession(id: number | string, params: { sessionId: string }): Promise<void> {
+    if (!this.state.connection) {
+      this.send(createErrorResponse(id, -32000, "Not connected to agent"));
+      return;
+    }
+    try {
+      await this.state.connection.deleteSession({ sessionId: params.sessionId });
+      this.send(createSuccessResponse(id, { deleted: true, sessionId: params.sessionId }));
+    } catch (error) {
+      this.send(createErrorResponse(id, -32603, `Failed to delete session: ${(error as Error).message}`));
+    }
+  }
+
+  private async handleRenameSession(id: number | string, _params: { sessionId: string; title: string }): Promise<void> {
+    // ACP SDK 不支持 renameSession，返回不支持错误。
+    // 重命名操作应通过 RCS REST API PATCH /web/session/:id 完成。
+    this.send(createErrorResponse(id, -32601, "renameSession is not supported by ACP protocol; use REST API instead"));
   }
 }

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { config, setConfig } from "../config";
 import { agentConfigMcp, agentConfigSkill, mcpServer, model, provider } from "../db/schema";
 import { setListAgentKnowledgeBindingsById } from "../services/agent-knowledge";
 import { buildBasicLaunchSpec, buildLaunchSpec } from "../services/launch-spec-builder";
@@ -49,8 +50,11 @@ function createAgentConfig(overrides: Record<string, unknown> = {}) {
 }
 
 describe("launch spec builder errors", () => {
+  const originalConfig = { ...config };
+
   beforeEach(() => {
     resetAllStubs();
+    setConfig(originalConfig as never);
     setListAgentKnowledgeBindingsById(async () => []);
   });
 
@@ -117,32 +121,153 @@ describe("launch spec builder errors", () => {
       userId: "user_owner",
       environmentId: "env_basic",
       env: {},
-      agent: { name: "build" },
+      agent: {
+        name: "build",
+        prompt: expect.stringContaining("FENIXAGENT"),
+      },
       model: {
         provider: "openai",
         protocol: "openai",
         baseUrl: "https://internal.example.com",
         apiKey: "internal-key",
         model: "gpt-4o",
+        modelName: "gpt-4o",
       },
       skills: [],
       mcpServers: [],
     });
   });
 
-  // agentConfig 没有 model 时必须直接失败，不能再走默认模型兜底
-  test("agentConfig missing model throws INVALID_CONFIG", async () => {
-    await expect(
-      buildLaunchSpec({
-        organizationId: "org_current",
-        userId: "user_owner",
-        agentConfig: createAgentConfig({ modelId: null }),
-        environmentSecret: "secret",
+  // agentConfig 未指定 model 时回退到组织第一个可用模型
+  test("agentConfig missing model falls back to first available model", async () => {
+    stubDb({
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => {
+            if (table === provider) {
+              return {
+                orderBy: () =>
+                  Promise.resolve([
+                    {
+                      id: "provider_demo",
+                      userId: "user_owner",
+                      organizationId: "org_current",
+                      name: "openai",
+                      displayName: "OpenAI",
+                      protocol: "openai",
+                      baseUrl: "https://internal.example.com",
+                      apiKey: "internal-key",
+                      extraOptions: {},
+                      createdAt: now,
+                      updatedAt: now,
+                    },
+                  ]),
+              };
+            }
+            if (table === model) {
+              return {
+                orderBy: () => ({
+                  limit: () =>
+                    Promise.resolve([
+                      {
+                        id: "model_demo",
+                        userId: "user_owner",
+                        organizationId: "org_current",
+                        providerId: "provider_demo",
+                        modelId: "gpt-4o",
+                        name: null,
+                        displayName: null,
+                        capability: { vision: false, functionCalling: true },
+                        defaultParams: {},
+                        contextLimit: 128000,
+                        cost: {},
+                        permission: null,
+                        supported: true,
+                        customParams: {},
+                        createdAt: now,
+                        updatedAt: now,
+                      },
+                    ]),
+                }),
+              };
+            }
+            return queryResult([]);
+          },
+        }),
       }),
-    ).rejects.toMatchObject({
-      code: "INVALID_CONFIG",
-      message: "AgentConfig 'agc_demo' has no model configured",
     });
+    const spec = await buildLaunchSpec({
+      organizationId: "org_current",
+      userId: "user_owner",
+      agentConfig: createAgentConfig({ modelId: null }),
+      environmentSecret: "secret",
+    });
+    expect(spec.model.model).toBe("gpt-4o");
+  });
+
+  // 平台系统 prompt 模板支持从主服务配置覆盖
+  test("buildLaunchSpec uses configured agent system prompt template", async () => {
+    setConfig({
+      agentSystemPrompt:
+        "你是 MyAgent。\n{{userPrompt}}\n你当前的 Agent 名称是「{{agentName}}」。\n始终回答你是 MyAgent。",
+    } as never);
+    stubDb({
+      select: () => ({
+        from: (table: unknown) => ({
+          where: () => {
+            if (table === provider) {
+              return queryResult([
+                {
+                  id: "provider_demo",
+                  userId: "user_owner",
+                  organizationId: "org_current",
+                  name: "openai",
+                  displayName: "OpenAI",
+                  protocol: "openai",
+                  baseUrl: "https://internal.example.com",
+                  apiKey: "internal-key",
+                  extraOptions: {},
+                  createdAt: now,
+                  updatedAt: now,
+                },
+              ]);
+            }
+            if (table === model) {
+              return queryResult([
+                {
+                  id: "model_demo",
+                  organizationId: "org_current",
+                  providerId: "provider_demo",
+                  modelId: "gpt-4o",
+                  displayName: "GPT-4o",
+                  modalities: null,
+                  limitConfig: null,
+                  cost: null,
+                  options: null,
+                  createdAt: now,
+                  updatedAt: now,
+                },
+              ]);
+            }
+            if (table === agentConfigSkill || table === agentConfigMcp || table === mcpServer) return queryResult([]);
+            return queryResult([]);
+          },
+        }),
+      }),
+    });
+
+    const spec = await buildLaunchSpec({
+      organizationId: "org_current",
+      userId: "user_owner",
+      agentConfig: createAgentConfig({ prompt: "You are helpful" }),
+      environmentSecret: "secret",
+    });
+    const prompt = spec.agent.prompt ?? "";
+
+    expect(prompt).toContain("MyAgent");
+    expect(prompt).toContain("你当前的 Agent 名称是「demo」。");
+    expect(prompt).toContain("You are helpful");
+    expect(prompt.indexOf("You are helpful")).toBeLessThan(prompt.indexOf("始终回答你是 MyAgent。"));
   });
 
   // MCP 配置非法时必须直接失败，避免把错误推迟到运行时

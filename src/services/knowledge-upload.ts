@@ -4,14 +4,13 @@ import { basename, join } from "node:path";
 import type { KnowledgeResourceRow } from "../repositories/knowledge-base";
 import { knowledgeBaseRepo, knowledgeResourceRepo } from "../repositories/knowledge-base";
 import {
-  buildKnowledgeBaseRemoteId,
   listKnowledgeBaseResources,
   resolveKnowledgeTenantIdentity,
   touchKnowledgeBaseUpdatedAt,
   upsertKnowledgeBaseStatusFromResources,
 } from "./knowledge-base";
 import { getKnowledgeProvider } from "./knowledge-provider/registry";
-import type { KnowledgeProvider, KnowledgeResourceStatus } from "./knowledge-provider/types";
+import type { KnowledgeResourceStatus } from "./knowledge-provider/types";
 
 const KNOWLEDGE_UPLOAD_ROOT = join(process.cwd(), "data/knowledge-upload");
 
@@ -20,55 +19,6 @@ function generateKnowledgeResourceId(): string {
 }
 
 export { setKnowledgeProviderForTesting as setKnowledgeUploadProviderForTesting } from "./knowledge-provider/registry";
-
-function isMissingParentUriError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return message.includes("Parent URI does not exist");
-}
-
-function sanitizeResourceName(value: string): string {
-  return basename(value || "resource").replace(/[\\/]/g, "_");
-}
-
-function buildKnowledgeResourceRemoteId(knowledgeBaseRemoteId: string, sourceName: string): string {
-  const root = knowledgeBaseRemoteId.endsWith("/") ? knowledgeBaseRemoteId : `${knowledgeBaseRemoteId}/`;
-  return `${root}${sanitizeResourceName(sourceName)}`;
-}
-
-async function addResourceWithParentFallback(input: {
-  provider: KnowledgeProvider;
-  knowledgeBaseRemoteId?: string | null;
-  targetRemoteId?: string | null;
-  remoteAccountId: string;
-  remoteUserId: string;
-  filePath?: string;
-  url?: string;
-  sourceName?: string;
-}) {
-  try {
-    return await input.provider.addResource({
-      knowledgeBaseRemoteId: input.knowledgeBaseRemoteId ?? undefined,
-      targetRemoteId: input.targetRemoteId ?? undefined,
-      remoteAccountId: input.remoteAccountId,
-      remoteUserId: input.remoteUserId,
-      filePath: input.filePath,
-      url: input.url,
-      sourceName: input.sourceName,
-    });
-  } catch (error) {
-    if (!input.knowledgeBaseRemoteId || !isMissingParentUriError(error)) {
-      throw error;
-    }
-    return input.provider.addResource({
-      targetRemoteId: input.targetRemoteId ?? undefined,
-      remoteAccountId: input.remoteAccountId,
-      remoteUserId: input.remoteUserId,
-      filePath: input.filePath,
-      url: input.url,
-      sourceName: input.sourceName,
-    });
-  }
-}
 
 function sanitizeResource(row: KnowledgeResourceRow) {
   return {
@@ -85,20 +35,34 @@ function sanitizeResource(row: KnowledgeResourceRow) {
   };
 }
 
+/**
+ * 判断远端文档删除失败是否只是“对象已不存在”。
+ * 本地资源删除保持幂等，避免 RagFlow 侧人工清理后前端无法移除残留记录。
+ */
+function isRemoteKnowledgeResourceMissingError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  return (
+    message.includes("not found") ||
+    message.includes("not exist") ||
+    message.includes("nonexistent") ||
+    message.includes("document not found") ||
+    message.includes("http 404")
+  );
+}
+
 async function createOrReusePendingResource(
   knowledgeBaseId: string,
   sourceType: string,
   sourceName: string,
   sourcePath: string | null,
-  targetRemoteId: string,
 ) {
   const now = new Date();
-  const existing = await knowledgeResourceRepo.getByRemoteId(knowledgeBaseId, targetRemoteId);
 
+  // 先按 sourceName 检查是否已有同名资源（防止并发重复上传到 RagFlow）
+  const existing = await knowledgeResourceRepo.getBySourceName(knowledgeBaseId, sourceName);
   if (existing) {
     await knowledgeResourceRepo.update(existing.id, {
       sourceType,
-      sourceName,
       sourcePath,
       status: "pending",
       lastError: null,
@@ -114,7 +78,7 @@ async function createOrReusePendingResource(
     sourceType,
     sourceName,
     sourcePath,
-    remoteId: targetRemoteId,
+    remoteId: null, // remoteId 在 provider.addResource 返回 document_id 后才写入
     status: "pending",
     lastError: null,
     createdAt: now,
@@ -163,35 +127,31 @@ export async function uploadKnowledgeResource(userId: string, knowledgeBaseId: s
   if (!kb) {
     throw new Error("知识库不存在");
   }
-  const knowledgeBaseRemoteId = kb.remoteId ?? buildKnowledgeBaseRemoteId(userId, kb.slug);
+  if (!kb.remoteId) {
+    throw new Error("知识库 remoteId 不存在");
+  }
+
   const dir = join(KNOWLEDGE_UPLOAD_ROOT, userId, knowledgeBaseId);
   await mkdir(dir, { recursive: true });
   const sourceName = basename(file.name || "upload.bin");
   const filePath = join(dir, `${Date.now()}-${sourceName}`);
   await writeFile(filePath, Buffer.from(await file.arrayBuffer()));
-  const targetRemoteId = buildKnowledgeResourceRemoteId(knowledgeBaseRemoteId, sourceName);
 
-  const resourceId = await createOrReusePendingResource(
-    knowledgeBaseId,
-    "upload",
-    sourceName,
-    filePath,
-    targetRemoteId,
-  );
+  const resourceId = await createOrReusePendingResource(knowledgeBaseId, "upload", sourceName, filePath);
+
   try {
     const tenantIdentity = resolveKnowledgeTenantIdentity(kb);
-    const remote = await addResourceWithParentFallback({
-      provider: getKnowledgeProvider(),
-      knowledgeBaseRemoteId,
-      targetRemoteId,
+    const remote = await getKnowledgeProvider().addResource({
+      knowledgeBaseRemoteId: kb.remoteId,
       remoteAccountId: tenantIdentity.remoteAccountId,
       remoteUserId: tenantIdentity.remoteUserId,
       filePath,
       sourceName,
     });
+
     await completeResource(resourceId, knowledgeBaseId, {
       remoteId: remote.remoteId,
-      knowledgeBaseRemoteId: remote.knowledgeBaseRemoteId ?? knowledgeBaseRemoteId,
+      knowledgeBaseRemoteId: remote.knowledgeBaseRemoteId ?? kb.remoteId,
       status: remote.status,
       lastError: remote.lastError ?? null,
     });
@@ -212,36 +172,33 @@ export async function importKnowledgeResourceFromUrl(
   if (!kb) {
     throw new Error("知识库不存在");
   }
-  const knowledgeBaseRemoteId = kb.remoteId ?? buildKnowledgeBaseRemoteId(userId, kb.slug);
+  if (!kb.remoteId) {
+    throw new Error("知识库 remoteId 不存在");
+  }
+
   const sourceName = input.sourceName?.trim() || basename(new URL(input.url).pathname || "resource");
-  const targetRemoteId = buildKnowledgeResourceRemoteId(knowledgeBaseRemoteId, sourceName || input.url);
-  const resourceId = await createOrReusePendingResource(
-    knowledgeBaseId,
-    "url",
-    sourceName || input.url,
-    input.url,
-    targetRemoteId,
-  );
+  const resourceId = await createOrReusePendingResource(knowledgeBaseId, "url", sourceName || input.url, input.url);
+
   try {
     const tenantIdentity = resolveKnowledgeTenantIdentity(kb);
-    const remote = await addResourceWithParentFallback({
-      provider: getKnowledgeProvider(),
-      knowledgeBaseRemoteId,
-      targetRemoteId,
+    const remote = await getKnowledgeProvider().addResource({
+      knowledgeBaseRemoteId: kb.remoteId,
       remoteAccountId: tenantIdentity.remoteAccountId,
       remoteUserId: tenantIdentity.remoteUserId,
       url: input.url,
       sourceName: input.sourceName,
     });
+
     await completeResource(resourceId, knowledgeBaseId, {
       remoteId: remote.remoteId,
-      knowledgeBaseRemoteId: remote.knowledgeBaseRemoteId ?? knowledgeBaseRemoteId,
+      knowledgeBaseRemoteId: remote.knowledgeBaseRemoteId ?? kb.remoteId,
       status: remote.status,
       lastError: remote.lastError ?? null,
     });
   } catch (error) {
     await failResource(resourceId, knowledgeBaseId, (error as Error).message);
   }
+
   const row = await knowledgeResourceRepo.getById(resourceId);
   return sanitizeResource(row!);
 }
@@ -267,18 +224,31 @@ export async function deleteKnowledgeResource(userId: string, knowledgeBaseId: s
 
   if (resourceRow.remoteId) {
     const tenantIdentity = resolveKnowledgeTenantIdentity(kb);
-    await getKnowledgeProvider().deleteResource({
-      resourceRemoteId: resourceRow.remoteId,
-      remoteAccountId: tenantIdentity.remoteAccountId,
-      remoteUserId: tenantIdentity.remoteUserId,
-      recursive: true,
-    });
+    try {
+      await getKnowledgeProvider().deleteResource({
+        resourceRemoteId: resourceRow.remoteId,
+        knowledgeBaseRemoteId: kb.remoteId!,
+        remoteAccountId: tenantIdentity.remoteAccountId,
+        remoteUserId: tenantIdentity.remoteUserId,
+        recursive: true,
+      });
+    } catch (err) {
+      console.error(err);
+      if (!isRemoteKnowledgeResourceMissingError(err)) {
+        throw err;
+      }
+      console.warn("Remote knowledge resource is already missing; continuing local deletion", {
+        resourceId,
+        remoteId: resourceRow.remoteId,
+        knowledgeBaseId,
+      });
+    }
   }
 
   await knowledgeResourceRepo.delete(resourceId);
   await upsertKnowledgeBaseStatusFromResources(knowledgeBaseId);
 
-  return { success: true as const, data: { ok: true } };
+  return { success: true as const, data: null };
 }
 
 export async function refreshKnowledgeResourceStatus(userId: string, knowledgeBaseId: string) {

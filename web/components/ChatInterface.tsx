@@ -1,6 +1,6 @@
 import { getParentToolUseId } from "acp-link/types";
 import imageCompression from "browser-image-compression";
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ACPClient } from "../src/acp/client";
 import type {
@@ -8,12 +8,13 @@ import type {
   ImageContent,
   PermissionOption,
   PermissionRequestPayload,
-  SessionMode,
+  PromptUsage,
   SessionUpdate,
 } from "../src/acp/types";
 import { useCommands } from "../src/hooks/useCommands";
 import { useModes } from "../src/hooks/useModes";
 import { flushContext, isVisibleContentBlock } from "../src/lib/context-queue";
+import { computeStats, type TokenStats } from "../src/lib/token-stats";
 import type {
   ChatInputMessage,
   PendingPermission,
@@ -25,12 +26,12 @@ import type {
   UserMessageImage,
 } from "../src/lib/types";
 import { ContextPanel } from "./ContextPanel";
-import { ChatInput } from "./chat/ChatInput";
+import { ChatComposer } from "./chat/ChatComposer";
 import { ChatView } from "./chat/ChatView";
+import { extractDisplayMeta, resolveToolCardKind } from "./chat/narrators/helpers";
 import { PermissionPanel } from "./chat/PermissionPanel";
 import type { TodoItem } from "./chat/TodoPanel";
 import { isTodoWriteToolCall, parseTodosFromRawInput, TodoPanel } from "./chat/TodoPanel";
-import { ModelSelectorPopover } from "./model-selector";
 
 // Image compression options
 // Claude API has a 5MB limit, so we target 2MB to be safe
@@ -67,10 +68,7 @@ function dataUrlToBlob(dataUrl: string): Blob {
   return new Blob([bytes], { type: mimeType });
 }
 
-import { Check, ChevronDown, ChevronUp, Plus, Shield } from "lucide-react";
 import { Button } from "./ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
-import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 // =============================================================================
 // Type Definitions - imported from shared types module
@@ -85,61 +83,9 @@ interface ChatInterfaceProps {
   onSessionCreated?: (sessionId: string) => void;
   scenePrompt?: string;
   onPromptComplete?: () => void;
+  /** 上下文标识：变化时自动触发 newSession（如工作流 ID 变化） */
+  contextKey?: string;
 }
-
-// =============================================================================
-// Session Mode Selector (dynamic from agent)
-// =============================================================================
-
-function SessionModeSelector({
-  modes,
-  currentModeId,
-  onModeChange,
-}: {
-  modes: SessionMode[];
-  currentModeId: string | null;
-  onModeChange: (modeId: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const current = modes.find((m) => m.id === currentModeId) ?? modes[0];
-
-  if (modes.length === 0) return null;
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button variant="ghost" size="sm" className="gap-1.5 text-muted-foreground hover:text-foreground h-7 px-2">
-          <Shield className="h-3 w-3" />
-          <span className="max-w-24 truncate">{current?.name ?? "默认"}</span>
-          {open ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-64 p-1" align="start">
-        {modes.map((m) => (
-          <button
-            key={m.id}
-            type="button"
-            onClick={() => {
-              onModeChange(m.id);
-              setOpen(false);
-            }}
-            className="flex w-full items-start gap-2 rounded-md px-2.5 py-2 text-left hover:bg-surface-2 transition-colors"
-          >
-            <span className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center">
-              {currentModeId === m.id && <Check className="h-3.5 w-3.5 text-brand" />}
-            </span>
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-medium text-text-primary">{m.name}</div>
-              {m.description && <div className="text-xs text-text-muted">{m.description}</div>}
-            </div>
-          </button>
-        ))}
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -166,6 +112,48 @@ function findToolCallIndex(entries: ThreadEntry[], toolCallId: string): number {
 
 // 终态集合 — 已处于终态的工具调用不接受服务器状态覆盖
 const TERMINAL_STATUSES = new Set<ToolCallStatus>(["canceled", "rejected"]);
+
+/**
+ * 一轮 prompt 结束时的兜底：把仍为 running 的 tool_call 标记为 complete。
+ *
+ * 远程 agent（如 claude --acp）有时不在工具执行完成时推送
+ * status="completed" 的 session/update，导致 tool_call 永久卡在 running，
+ * UI 一直转圈。这里在 prompt_complete 时统一兜底，让 UI 终止 loading。
+ *
+ * 处理范围：
+ * - 顶层与 subEntries 中的所有 tool_call 都递归处理
+ * - 只改 status==="running" 的条目；其他状态（含 waiting_for_confirmation、
+ *   canceled、rejected、error、complete）保持不动
+ * - 没有任何 running 工具时返回原数组引用，避免无意义重渲染
+ */
+export function finalizeRunningToolCalls(entries: ThreadEntry[]): ThreadEntry[] {
+  let changed = false;
+
+  const mapEntry = (entry: ThreadEntry): ThreadEntry => {
+    if (entry.type !== "tool_call") return entry;
+
+    let nextToolCall = entry.toolCall;
+    if (entry.toolCall.status === "running") {
+      changed = true;
+      nextToolCall = { ...entry.toolCall, status: "complete" as ToolCallStatus };
+    }
+
+    // 递归处理子 agent 嵌套条目
+    if (entry.toolCall.subEntries && entry.toolCall.subEntries.length > 0) {
+      const nextSubEntries = entry.toolCall.subEntries.map(mapEntry);
+      // 仅在本次递归改动了子层、或顶层状态变化时才生成新对象
+      if (nextSubEntries !== entry.toolCall.subEntries || nextToolCall !== entry.toolCall) {
+        return { type: "tool_call", toolCall: { ...nextToolCall, subEntries: nextSubEntries } };
+      }
+      return entry;
+    }
+
+    return nextToolCall === entry.toolCall ? entry : { type: "tool_call", toolCall: nextToolCall };
+  };
+
+  const next = entries.map(mapEntry);
+  return changed ? next : entries;
+}
 
 // =============================================================================
 // 纯函数：将 SessionUpdate 应用到 entries 数组，返回新数组
@@ -243,16 +231,49 @@ function applySessionUpdateToEntries(entries: ThreadEntry[], update: SessionUpda
 
   // Handle tool call (UPSERT)
   if (update.sessionUpdate === "tool_call") {
+    // 处理 resume 回放中 CC SDK tool_use 格式：
+    // unstable_resumeSession 将 CC SDK tool_use block 整包放入 content 字段，
+    // 缺少 toolCallId/title/status，导致后续 tool_call_update 通过 findToolCallIndex 匹配失败。
+    // 此处从 content 中提取 id/name/input，补齐 ACP 标准字段。
+    let toolCallId = update.toolCallId as string | undefined;
+    let title = update.title as string | undefined;
+    let rawInput = update.rawInput as Record<string, unknown> | undefined;
+    let toolContent = update.content;
+    const nonArrayContent = toolContent as unknown as Record<string, unknown> | undefined;
+    const isCCSdkToolUse =
+      !toolCallId &&
+      nonArrayContent &&
+      !Array.isArray(nonArrayContent) &&
+      typeof nonArrayContent === "object" &&
+      nonArrayContent.type === "tool_use";
+    if (isCCSdkToolUse) {
+      toolCallId = (nonArrayContent.id as string) ?? toolCallId;
+      title = (nonArrayContent.name as string) ?? title;
+      rawInput = (nonArrayContent.input as Record<string, unknown>) ?? rawInput;
+      toolContent = undefined; // CC SDK 格式不是有效的 ACP ToolCallContent[]
+    }
+
+    // ① 顶层 display（opencode 风格，可能不在 ACP ToolCallUpdate 标准类型中，需转型访问）
+    const topLevelDisplay = (update as unknown as Record<string, unknown>).display as
+      | Record<string, unknown>
+      | undefined;
+    const display = extractDisplayMeta(update.rawOutput, update._meta, topLevelDisplay);
+    // 构造临时 tool 对象用于 resolveToolCardKind
+    const tempTool = { display, rawInput, rawOutput: update.rawOutput };
+    const kind = resolveToolCardKind(tempTool, update._meta);
     const toolCallData: ToolCallData = {
-      id: update.toolCallId,
-      title: update.title,
+      id: toolCallId ?? "",
+      title: title ?? "",
       status: mapToolStatus(update.status),
-      content: update.content,
-      rawInput: update.rawInput,
-      rawOutput: update.rawOutput,
+      kind,
+      content: toolContent,
+      // 条件展开避免 undefined 覆盖已有值（rawInput 可能是空对象 {}，用 != null 而非 &&）
+      ...(rawInput != null ? { rawInput } : {}),
+      ...(update.rawOutput != null ? { rawOutput: update.rawOutput } : {}),
+      ...(display && { display }),
     };
 
-    const existingIndex = findToolCallIndex(entries, update.toolCallId);
+    const existingIndex = findToolCallIndex(entries, toolCallId ?? "");
     if (existingIndex >= 0) {
       return entries.map((entry, index) => {
         if (index !== existingIndex || entry.type !== "tool_call") return entry;
@@ -271,16 +292,30 @@ function applySessionUpdateToEntries(entries: ThreadEntry[], update: SessionUpda
     const existingIndex = findToolCallIndex(entries, update.toolCallId);
 
     if (existingIndex < 0) {
-      const failedEntry: ToolCallEntry = {
+      // tool_call_update 先于 tool_call 到达，或页面刷新后前端 state 丢失：
+      // 基于 update 数据构建正常占位条目，而非硬造 error 条目。
+      // 页面刷新场景下 agent 发送的 tool_call_update 可能携带有效 status/rawOutput 等数据，
+      // 硬造 error 会导致正常完成的工具调用显示为"失败"+"未知错误"。
+      const topLevelDisplay = (update as unknown as Record<string, unknown>).display as
+        | Record<string, unknown>
+        | undefined;
+      const fallbackDisplay = extractDisplayMeta(update.rawOutput, update._meta, topLevelDisplay);
+      const tempTool = { display: fallbackDisplay, rawInput: update.rawInput, rawOutput: update.rawOutput };
+      const kind = resolveToolCardKind(tempTool, update._meta);
+      const placeholder: ToolCallEntry = {
         type: "tool_call",
         toolCall: {
           id: update.toolCallId,
-          title: update.title || "Tool call not found",
-          status: "error",
-          content: [{ type: "content", content: { type: "text", text: "Tool call not found" } }],
+          title: update.title || "Running tool",
+          status: update.status ? mapToolStatus(update.status) : "running",
+          kind,
+          content: update.content || [],
+          ...(update.rawInput != null ? { rawInput: update.rawInput } : {}),
+          ...(update.rawOutput != null ? { rawOutput: update.rawOutput } : {}),
+          ...(fallbackDisplay && { display: fallbackDisplay }),
         },
       };
-      return [...entries, failedEntry];
+      return [...entries, placeholder];
     }
 
     return entries.map((entry, index) => {
@@ -293,16 +328,33 @@ function applySessionUpdateToEntries(entries: ThreadEntry[], update: SessionUpda
       const mergedContent = update.content
         ? [...(entry.toolCall.content || []), ...update.content]
         : entry.toolCall.content;
+      const topLevelDisplay = (update as unknown as Record<string, unknown>).display as
+        | Record<string, unknown>
+        | undefined;
+      // extractDisplayMeta 可能返回 undefined（metadata 结构异常），
+      // 此时应保留旧 display 值，避免 display 丢失
+      const display = update.rawOutput
+        ? (extractDisplayMeta(update.rawOutput, update._meta, topLevelDisplay) ?? entry.toolCall.display)
+        : entry.toolCall.display;
+      // kind 同步更新（rawInput/output 变化可能导致 kind 变化）
+      const tempTool = {
+        display,
+        rawInput: update.rawInput ?? entry.toolCall.rawInput,
+        rawOutput: update.rawOutput ?? entry.toolCall.rawOutput,
+      };
+      const kind = resolveToolCardKind(tempTool, update._meta);
 
       return {
         type: "tool_call",
         toolCall: {
           ...entry.toolCall,
           status: newStatus,
+          kind,
           ...(update.title && { title: update.title }),
           content: mergedContent,
           ...(update.rawInput && { rawInput: update.rawInput }),
           ...(update.rawOutput && { rawOutput: update.rawOutput }),
+          ...(display && { display }),
         },
       };
     });
@@ -334,7 +386,17 @@ export interface ChatInterfaceHandle {
 }
 
 export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>(function ChatInterface(
-  { client, agentId, readonly, hideContextPanel, rcsSessionId, onSessionCreated, scenePrompt, onPromptComplete },
+  {
+    client,
+    agentId,
+    readonly,
+    hideContextPanel,
+    rcsSessionId,
+    onSessionCreated,
+    scenePrompt,
+    contextKey,
+    onPromptComplete,
+  },
   ref,
 ) {
   const { t } = useTranslation("components");
@@ -343,6 +405,9 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
   const [isLoading, setIsLoading] = useState(false);
   // 断连时记住 loading 状态，WS 重连 resume 后恢复
   const wasLoadingBeforeDisconnect = useRef(false);
+  // 追踪所有工具调用的 raw ACP status（toolCallId → status 字符串），
+  // 用于 resume 回放后判断是否有未完成的工具调用，从而决定是否恢复 loading 态
+  const toolEndStatusRef = useRef<Map<string, string>>(new Map());
   const [sessionReady, setSessionReady] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
@@ -351,11 +416,17 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
   const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 追踪用户主动取消操作，避免取消后触发错误提示
   const userCancelledRef = useRef(false);
+  // 追踪 errorMessageHandler 是否已设置后端错误，避免 promptCompleteHandler 的通用错误覆盖具体报错
+  const backendErrorRef = useRef(false);
+  // 追踪一轮 prompt 中是否收到 agent 输出（agent_message/tool_call 等），用于检测空响应
+  const hasAssistantOutputRef = useRef(false);
   // Todo 面板状态 — 每次 todowrite 调用替换
   const [todoItems, setTodoItems] = useState<TodoItem[]>([]);
   // Reference: Zed's supports_images() checks prompt_capabilities.image
   const [supportsImages, setSupportsImages] = useState(false);
   const [contextPanelOpen, setContextPanelOpen] = useState(true);
+  // ACP 返回的真实 token 用量（prompt/complete 响应），用于 ContextPanel 优先展示
+  const [promptUsage, setPromptUsage] = useState<PromptUsage | null>(null);
   const { commands: availableCommands } = useCommands(client);
   const { availableModes, currentModeId, setMode } = useModes(client);
 
@@ -376,7 +447,11 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
       errorTimerRef.current = null;
     }
     userCancelledRef.current = false;
+    backendErrorRef.current = false;
     wasLoadingBeforeDisconnect.current = false;
+    hasAssistantOutputRef.current = false;
+    toolEndStatusRef.current.clear();
+    setPromptUsage(null);
   }, []);
 
   const storageKey = agentId ? `acp_last_session_${agentId}` : null;
@@ -448,6 +523,9 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
             id: request.toolCall.toolCallId,
             title: request.toolCall.title || "Permission Request",
             status: "waiting_for_confirmation",
+            kind: resolveToolCardKind({
+              rawInput: (request.toolCall as Record<string, unknown>).rawInput as Record<string, unknown>,
+            }),
             permissionRequest: {
               requestId: request.requestId,
               options: request.options,
@@ -469,6 +547,22 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
   const handleSessionUpdate = useCallback((sessionId: string, update: SessionUpdate) => {
     if (activeSessionIdRef.current && sessionId !== activeSessionIdRef.current) {
       return;
+    }
+
+    // 记录本轮 prompt 中出现了 agent 输出，用于 promptComplete 时检测空响应
+    if (
+      update.sessionUpdate === "agent_message_chunk" ||
+      update.sessionUpdate === "tool_call" ||
+      update.sessionUpdate === "tool_call_update"
+    ) {
+      hasAssistantOutputRef.current = true;
+    }
+
+    // 记录工具调用的 ACP 原始状态，用于 resume 回放后判断是否有未完成的工具
+    if (update.sessionUpdate === "tool_call" && update.status) {
+      toolEndStatusRef.current.set(update.toolCallId, update.status);
+    } else if (update.sessionUpdate === "tool_call_update" && update.status) {
+      toolEndStatusRef.current.set(update.toolCallId, update.status);
     }
 
     // 拦截 todowrite 工具调用 → 更新 Todo 面板（仅顶层）
@@ -511,6 +605,8 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
           update.toolCallId === parentToolUseId
         ) {
           const newStatus = update.status ? mapToolStatus(update.status) : parentEntry.toolCall.status;
+          // 提取 display 元数据，避免子 agent 父 entry 的 display/rawOutput 丢失
+          const parentDisplay = update.rawOutput ? extractDisplayMeta(update.rawOutput, update._meta) : undefined;
           return prev.map((entry, i) => {
             if (i !== parentIndex || entry.type !== "tool_call") return entry;
             return {
@@ -519,6 +615,8 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
                 ...entry.toolCall,
                 status: newStatus,
                 subEntries: newSubEntries,
+                ...(update.rawOutput != null ? { rawOutput: update.rawOutput } : {}),
+                ...(parentDisplay && { display: parentDisplay }),
               },
             };
           });
@@ -555,9 +653,17 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
     client.setSessionLoadedHandler((sessionId) => {
       console.log("[ChatInterface] Session loaded/resumed:", sessionId);
       activateSession(sessionId, { resetEntries: false });
-      // WS 重连 resume：恢复断连前的 loading 状态（agent 可能仍在执行）
-      if (wasLoadingBeforeDisconnect.current) {
-        console.log("[ChatInterface] Restoring isLoading=true after reconnect resume");
+      // 回放后检查：如果存在未完成的工具调用（status 非终态），说明 agent 仍在执行
+      const hasUnfinishedTool = [...toolEndStatusRef.current.values()].some(
+        (status) => !["completed", "failed", "canceled", "cancelled", "rejected"].includes(status),
+      );
+      if (hasUnfinishedTool) {
+        console.log("[ChatInterface] Resume with unfinished tool call, setting isLoading=true");
+        setIsLoading(true);
+        wasLoadingBeforeDisconnect.current = false;
+      } else if (wasLoadingBeforeDisconnect.current) {
+        // WS 重连 resume：恢复断连前的 loading 状态（agent 可能仍在执行，但无工具调用可跟踪）
+        console.log("[ChatInterface] Restoring isLoading=true after reconnect resume (no tool to track)");
         setIsLoading(true);
         wasLoadingBeforeDisconnect.current = false;
       }
@@ -594,13 +700,51 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
       // Note: Tool calls are already marked as "canceled" in handleCancel before this fires
       setIsLoading(false);
 
+      // 清理工具状态追踪：本轮 prompt 结束，所有工具调用状态重置
+      toolEndStatusRef.current.clear();
+
+      // 存储 ACP 真实 token 用量，供 ContextPanel 优先展示
+      setPromptUsage(usage ?? null);
+
+      // 兜底：远程 agent（如 claude --acp）有时不在工具完成时推送 status="completed"
+      // 的 session_update，导致 tool_call 永久卡在 running。一轮 prompt 结束后，
+      // 把仍为 running 的工具调用统一标记为 complete，避免 UI 持续 loading。
+      // 已是终态（canceled/rejected/error/complete）的不动；handleCancel 已经把
+      // 取消的工具改成 canceled，这里只兜底未通知完成的 running 调用。
+      setEntries((prev) => finalizeRunningToolCalls(prev));
+
       // 用户主动取消时跳过错误提示，避免误导用户
       if (userCancelledRef.current) {
         userCancelledRef.current = false;
       } else {
-        // inputTokens === 0 indicates the prompt was not processed (error)
-        if (usage && usage.inputTokens === 0) {
-          setErrorMessage("请求未能正常处理，请检查 Agent 或大模型状态后重试");
+        // 如果后端已通过 errorMessageHandler 报告了具体错误，不再用通用错误覆盖
+        if (backendErrorRef.current) {
+          backendErrorRef.current = false;
+        }
+        // inputTokens === 0 且 outputTokens === 0 说明 prompt 未被处理（真错误）
+        // 仅 inputTokens === 0 可能是 prompt caching 导致的正常情况（CCB/OC 引擎常见）
+        else if (usage && usage.inputTokens === 0 && (usage.outputTokens ?? 0) === 0) {
+          setErrorMessage(
+            t("chatInterface.processingErrorDetail", {
+              stopReason,
+              inputTokens: String(usage.inputTokens),
+              outputTokens: String(usage.outputTokens ?? 0),
+            }),
+          );
+          if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+          errorTimerRef.current = setTimeout(() => setErrorMessage(null), 8000);
+        }
+        // 检测空响应：prompt 正常结束但 agent 没有产生任何输出
+        // 典型场景：opencode 返回 {stopReason:"end_turn","_meta":{}} 无 usage 无内容
+        else if (!hasAssistantOutputRef.current) {
+          console.warn("[ChatInterface] Prompt completed with no assistant output");
+          setErrorMessage(
+            t("chatInterface.processingErrorDetail", {
+              stopReason,
+              inputTokens: String(usage?.inputTokens ?? "N/A"),
+              outputTokens: String(usage?.outputTokens ?? "N/A"),
+            }),
+          );
           if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
           errorTimerRef.current = setTimeout(() => setErrorMessage(null), 8000);
         }
@@ -611,10 +755,43 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
 
     client.setPermissionRequestHandler(handlePermissionRequest);
 
+    // InteractiveQuestion handler — 当 CC 使用 AskUserQuestion 等交互工具时触发
+    client.setInteractiveQuestionHandler((iq) => {
+      console.log("[ChatInterface] Interactive question:", iq);
+      // 将问题转为 pending permission 格式，复用 PermissionPanel 渲染
+      const question = iq.questions[0];
+      if (!question) return;
+      setEntries((prev) => [
+        ...prev,
+        {
+          type: "tool_call" as const,
+          id: `iq-${iq.questionId}`,
+          toolCall: {
+            id: iq.questionId,
+            title: question.header || iq.toolName,
+            status: "waiting_for_confirmation" as ToolCallStatus,
+            kind: "question" as const,
+            rawInput: { questions: iq.questions },
+            permissionRequest: {
+              requestId: iq.questionId,
+              options: question.options.map((opt, i) => ({
+                kind: (i === 0 ? "allow_always" : "allow_once") as PermissionOption["kind"],
+                name: `${opt.label}${opt.description ? ` — ${opt.description}` : ""}`,
+                optionId: opt.label,
+              })),
+            },
+            isStandalonePermission: true,
+          },
+        },
+      ]);
+    });
+
     client.setErrorMessageHandler((msg) => {
       console.error("[ChatInterface] Agent error:", msg);
       // 用户主动取消后，忽略服务端回传的错误消息
       if (userCancelledRef.current) return;
+      // 标记后端已报错，避免 promptCompleteHandler 用通用错误覆盖具体报错
+      backendErrorRef.current = true;
       setErrorMessage(msg);
       if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
       errorTimerRef.current = setTimeout(() => setErrorMessage(null), 5000);
@@ -639,9 +816,14 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
     resetThreadState,
     onSessionCreated,
     onPromptComplete,
+    t,
   ]);
 
-  // Broadcast stats to AgentAppShell via custom event (for top-level StatusHeader)
+  // 计算 token 统计，传给 ChatComposer 元信息条
+  // 复用 entries 派生结果，避免重复遍历；chat:stats dispatch 仍独立维护以便外部监听
+  const tokenStats: TokenStats = useMemo(() => computeStats(entries), [entries]);
+
+  // Broadcast entries via custom event（路由层 chat.$agentId.tsx 据此派生 changedFiles 给 ArtifactsPanel）
   useEffect(() => {
     const modelName = client.modelState
       ? (client.modelState.availableModels.find((m) => m.modelId === client.modelState!.currentModelId)?.name ??
@@ -678,6 +860,15 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
     // The session_created handler will set sessionReady=true when ready
     requestCreateSession();
   }, [isLoading, resetThreadState, requestCreateSession, client.cancel]);
+
+  // 当 contextKey 变化时自动开始新会话（仅在 contextKey 有值且发生变化时触发）
+  const contextKeyRef = useRef(contextKey);
+  useEffect(() => {
+    if (contextKey !== undefined && contextKeyRef.current !== undefined && contextKeyRef.current !== contextKey) {
+      handleNewSession();
+    }
+    contextKeyRef.current = contextKey;
+  }, [contextKey, handleNewSession]);
 
   useImperativeHandle(
     ref,
@@ -732,6 +923,8 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
         }
         return false;
       });
+      // 兜底清理：prompt_complete 未及时到达时避免残留的非终态工具状态
+      toolEndStatusRef.current.clear();
     }, 3000);
   }, [client]);
 
@@ -918,6 +1111,9 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
       };
       setEntries((prev) => [...prev, userEntry]);
       setIsLoading(true);
+      // 重置 agent 输出追踪和错误标记，用于本轮 prompt 检测
+      hasAssistantOutputRef.current = false;
+      backendErrorRef.current = false;
 
       userCancelledRef.current = false;
       try {
@@ -940,8 +1136,8 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
           onPermissionRespond={(requestId, optionId, optionKind) => {
             handlePermissionResponse(requestId, optionId, optionKind as PermissionOption["kind"] | null);
           }}
-          emptyTitle={sessionReady ? "开始对话" : undefined}
-          emptyDescription={sessionReady ? "输入消息开始与 ACP agent 聊天" : undefined}
+          emptyTitle={sessionReady ? t("chatEmpty.startConversation") : undefined}
+          emptyDescription={sessionReady ? t("chatEmpty.startConversationDesc") : undefined}
           sessionId={rcsSessionId ?? activeSessionId ?? undefined}
           envId={agentId}
         />
@@ -969,32 +1165,10 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
           </div>
         )}
 
-        {/* Model selector + New thread + ChatInput */}
+        {/* ChatComposer — 玻璃磨砂命令岛，整合输入框 + 元信息条 */}
         {!readonly && (
           <div className="flex-shrink-0">
-            <div className="max-w-3xl mx-auto w-full px-4 sm:px-8 pb-1 flex items-center justify-between">
-              <div className="flex items-center gap-1">
-                <SessionModeSelector modes={availableModes} currentModeId={currentModeId} onModeChange={setMode} />
-                <ModelSelectorPopover client={client} />
-              </div>
-              {entries.length > 0 && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 text-xs text-text-muted hover:text-brand font-display gap-1"
-                      onClick={handleNewSession}
-                    >
-                      <Plus className="h-3 w-3" />
-                      新会话
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>{t("chatInterface.newThread")}</TooltipContent>
-                </Tooltip>
-              )}
-            </div>
-            <ChatInput
+            <ChatComposer
               onSubmit={handleChatInputSubmit}
               isLoading={isLoading}
               onInterrupt={handleCancel}
@@ -1003,6 +1177,13 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
               supportsImages={supportsImages}
               commands={availableCommands.length > 0 ? availableCommands : undefined}
               envId={agentId}
+              client={client}
+              availableModes={availableModes}
+              currentModeId={currentModeId}
+              onModeChange={setMode}
+              tokenStats={tokenStats}
+              onNewSession={handleNewSession}
+              showNewSession={entries.length > 0}
             />
           </div>
         )}
@@ -1028,6 +1209,7 @@ export const ChatInterface = forwardRef<ChatInterfaceHandle, ChatInterfaceProps>
           }
           collapsed={!contextPanelOpen}
           onToggle={() => setContextPanelOpen(!contextPanelOpen)}
+          acpUsage={promptUsage}
         />
       )}
     </div>

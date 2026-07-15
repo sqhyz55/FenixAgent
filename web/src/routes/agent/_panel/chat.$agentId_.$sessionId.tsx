@@ -1,83 +1,10 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { PanelRight } from "lucide-react";
-import { lazy, Suspense, useEffect, useState } from "react";
-import { useTranslation } from "react-i18next";
-import { envApi } from "../../../../src/api/sdk";
-import type { ThreadEntry } from "../../../../src/lib/types";
-import { StatusHeader } from "../../../components/agent-panel/StatusHeader";
 
-const ChatPanel = lazy(() => import("../../../pages/agent-panel/ChatPanel").then((m) => ({ default: m.ChatPanel })));
-const ArtifactsPanel = lazy(() =>
-  import("../../../pages/agent-panel/ArtifactsPanel").then((m) => ({ default: m.ArtifactsPanel })),
-);
-
+/**
+ * chat session 路由桩 — 实际渲染由 AgentPanelLayout 中的 ChatArea 组件处理。
+ * ChatArea 始终挂载，通过 CSS display 控制可见性，实现 keep-alive 效果。
+ * 本文件仅保留路由定义，不渲染任何内容。
+ */
 export const Route = createFileRoute("/agent/_panel/chat/$agentId_/$sessionId")({
-  component: ChatWithSessionRoute,
+  component: () => null,
 });
-
-function ChatWithSessionRoute() {
-  const { agentId, sessionId } = Route.useParams();
-  const { t } = useTranslation("agentPanel");
-
-  const [artifactsCollapsed, setArtifactsCollapsed] = useState(() => {
-    const saved = localStorage.getItem("agent-panel:artifacts-collapsed");
-    return saved === "true";
-  });
-
-  const [envName, setEnvName] = useState<string | null>(null);
-
-  const [stats, setStats] = useState<{ agentName?: string; modelName?: string; entries: ThreadEntry[] }>({
-    entries: [],
-  });
-
-  useEffect(() => {
-    const handler = (e: Event) => setStats((e as CustomEvent).detail);
-    window.addEventListener("chat:stats", handler);
-    return () => window.removeEventListener("chat:stats", handler);
-  }, []);
-
-  // 加载 environment 名称
-  useEffect(() => {
-    if (!agentId) return;
-    envApi
-      .get({ id: agentId })
-      .then(({ data }) => setEnvName(data?.name ?? null))
-      .catch(() => setEnvName(null));
-  }, [agentId]);
-
-  useEffect(() => {
-    localStorage.setItem("agent-panel:artifacts-collapsed", String(artifactsCollapsed));
-  }, [artifactsCollapsed]);
-
-  return (
-    <Suspense
-      fallback={
-        <div className="flex flex-1 items-center justify-center">
-          <div className="h-8 w-8 rounded-full border-2 border-brand border-t-transparent animate-spin" />
-        </div>
-      }
-    >
-      <StatusHeader agentName={envName || stats.agentName} modelName={stats.modelName} entries={stats.entries} />
-      <div className="agent-panel-content">
-        <div className="agent-chat-area">
-          <ChatPanel agentId={agentId} sessionId={sessionId} />
-        </div>
-        <ArtifactsPanel
-          collapsed={artifactsCollapsed}
-          onToggleCollapse={() => setArtifactsCollapsed(!artifactsCollapsed)}
-          envId={agentId}
-        />
-        {artifactsCollapsed && (
-          <button
-            type="button"
-            className="agent-artifacts-expand-btn"
-            onClick={() => setArtifactsCollapsed(false)}
-            title={t("showArtifacts")}
-          >
-            <PanelRight className="h-3.5 w-3.5" />
-          </button>
-        )}
-      </div>
-    </Suspense>
-  );
-}

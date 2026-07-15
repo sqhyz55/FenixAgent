@@ -90,6 +90,111 @@
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
 }
 
+/* ── 紧凑横向字段 (label 左 input 右) ── */
+.wf-prop-field-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.wf-prop-field-inline label {
+  width: 72px;
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #6b7280;
+  font-weight: 500;
+  margin-bottom: 0;
+  text-align: right;
+  line-height: 1.3;
+}
+
+.wf-prop-field-inline input,
+.wf-prop-field-inline select {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #111827;
+  background: #fff;
+  outline: none;
+  transition: border-color 0.15s;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.wf-prop-field-inline input:focus,
+.wf-prop-field-inline select:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+}
+
+.wf-prop-field-inline input[readonly],
+.wf-prop-field-inline select[disabled] {
+  background: #f9fafb;
+  color: #6b7280;
+}
+
+/* ── 块级字段 (textarea 专用，保持纵向) ── */
+.wf-prop-field-block {
+  margin-bottom: 10px;
+}
+
+.wf-prop-field-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.wf-prop-field-block label {
+  font-size: 11px;
+  color: #6b7280;
+  font-weight: 500;
+  margin-bottom: 0;
+}
+
+/* ── 展开编辑按钮 ── */
+.wf-prop-expand-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  background: #fff;
+  color: #9ca3af;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.wf-prop-expand-btn:hover {
+  background: #f3f4f6;
+  color: #3b82f6;
+  border-color: #3b82f6;
+}
+
+/* ── 代码编辑 Dialog ── */
+.wf-code-dialog textarea {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  tab-size: 2;
+}
+
+/* ── 节点配置 Sheet ── */
+.wf-popover-body {
+  padding: 4px 0;
+}
+
+.wf-node-sheet .wf-popover-body {
+  padding: 4px 0;
+}
+
 .wf-prop-hint {
   padding: 16px;
   color: #9ca3af;
@@ -446,24 +551,36 @@
   border-radius: 99;
 }
 
-.wf-popover-body {
-  padding: 4px 0;
+.wf-popover-delete-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #ef4444;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
 }
 
-/* ── Meta Popover Anchor (bottom-right) ── */
-.wf-meta-popover-anchor {
+.wf-popover-delete-btn:hover {
+  background: #fef2f2;
+}
+
+/* ── Bottom-right Actions Group ── */
+.wf-bottom-actions {
   position: absolute;
   bottom: 12px;
   right: 12px;
   z-index: 5;
+  display: flex;
+  gap: 8px;
 }
 
-.wf-run-popover-anchor {
-  position: absolute;
-  bottom: 12px;
-  right: 52px;
-  z-index: 5;
-}
+/* wf-meta-popover-anchor 和 wf-run-popover-anchor 的定位已由 wf-bottom-actions 管理 */
 
 .wf-meta-trigger-btn {
   display: flex;
@@ -487,6 +604,33 @@
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
 }
 
+/* ── Dropdown Item (用于右下角弹出菜单) ── */
+.wf-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #374151;
+  cursor: pointer;
+  transition: background 0.12s;
+  border: none;
+  background: transparent;
+  text-align: left;
+}
+.wf-dropdown-item:hover {
+  background: #f3f4f6;
+}
+.wf-dropdown-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.wf-dropdown-item:disabled:hover {
+  background: transparent;
+}
+
 /* ── Workflow Sheet ── */
 .wf-sheet-body {
   flex: 1;
@@ -495,58 +639,4 @@
   flex-direction: column;
 }
 
-/* ── Data flow points (input/output) ── */
-.wf-point {
-  position: absolute;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  pointer-events: none;
-  z-index: 2;
-  transform: translateX(-50%);
-}
-
-.wf-point-in {
-  top: -6px;
-}
-
-.wf-point-out {
-  bottom: -6px;
-}
-
-.wf-point-label {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  font-size: 9px;
-  font-weight: 600;
-  padding: 1px 5px;
-  border-radius: 3px;
-  white-space: nowrap;
-  line-height: 1.4;
-  opacity: 0;
-  transition: opacity 0.15s;
-  pointer-events: none;
-}
-
-.wf-point:hover .wf-point-label {
-  opacity: 1;
-}
-
-.wf-point-in .wf-point-label {
-  bottom: calc(100% + 3px);
-}
-
-.wf-point-out .wf-point-label {
-  top: calc(100% + 3px);
-}
-
-.wf-point-label-out {
-  color: #10b981;
-  background: rgba(16, 185, 129, 0.1);
-}
-
-.wf-point-label-in {
-  color: #f59e0b;
-  background: rgba(245, 158, 11, 0.1);
-}
+/* ── END RESIZE HANDLES ── */

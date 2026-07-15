@@ -7,25 +7,7 @@
 // ── SSE 辅助函数 ──
 
 export function createSessionEventSource(sessionId: string): EventSource {
-  const uuid = getUuid();
-  const activeOrgId = localStorage.getItem("active_org_id");
-  const params = new URLSearchParams();
-  if (uuid) params.set("uuid", uuid);
-  if (activeOrgId) params.set("activeOrganizationId", activeOrgId);
-  const query = params.toString();
-  const url = query ? `/web/sessions/${sessionId}/events?${query}` : `/web/sessions/${sessionId}/events`;
-  return new EventSource(url, { withCredentials: true });
-}
-
-// ── S3 Presigned URL 上传辅助函数 ──
-
-export async function uploadToPresignedUrl(url: string, file: File, contentType: string): Promise<void> {
-  const res = await fetch(url, {
-    method: "PUT",
-    body: file,
-    headers: { "Content-Type": contentType },
-  });
-  if (!res.ok) throw new Error(`S3 upload failed: ${res.status}`);
+  return new EventSource(`/web/sessions/${sessionId}/events`, { withCredentials: true });
 }
 
 // ── UUID 存储辅助函数 ──

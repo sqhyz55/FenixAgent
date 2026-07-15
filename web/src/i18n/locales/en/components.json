@@ -35,7 +35,9 @@
     "uploadFile": "Upload file",
     "noFiles": "No files",
     "loadFailed": "Failed to load files",
-    "uploadFailed": "Upload failed"
+    "uploadFailed": "Upload failed",
+    "fileTooLarge": "{{name}} is too large (max {{max}})",
+    "uploadTooLarge": "Upload failed: file size exceeds the 100MB limit"
   },
   "identity": {
     "title": "Identity",
@@ -127,6 +129,86 @@
     "contextPlaceholder": "Context (placeholder), entries: {{count}}",
     "previewPlaceholder": "Preview (placeholder), entries: {{count}}"
   },
+  "panelMode": {
+    "files": "Files",
+    "sites": "Sites",
+    "sitesTabAriaLabel": "Site selector",
+    "sitesEmptyTitle": "No sites bound",
+    "sitesEmptyHint": "Bind a site in Agent config to preview it here.",
+    "pendingDiff": "{{count}} new file change(s) pending in Files",
+    "mountSite": "Mount Site",
+    "mountSiteAriaLabel": "Mount site",
+    "unmountSite": "Unmount",
+    "unmountSiteAriaLabel": "Unmount site",
+    "mountDialogTitle": "Mount Sites",
+    "mountDialogHint": "Select sites to mount to this agent",
+    "mountDialogConfirm": "Mount {{count}}",
+    "mountDialogConfirmNone": "Mount",
+    "noAvailableSites": "No more sites available to mount",
+    "unmountConfirmTitle": "Unmount site?",
+    "unmountConfirm": "Unmount \"{{name}}\" from this agent?",
+    "mountSuccess": "Mounted {{count}} site(s)",
+    "unmountSuccess": "Site unmounted",
+    "mountFailed": "Mount failed",
+    "unmountFailed": "Unmount failed",
+    "tasks": "Tasks",
+    "tasksEmpty": "No scheduled tasks bound to this agent",
+    "tasksManage": "Manage Tasks",
+    "tasksCount": "{{count}} task(s)",
+    "tasksLoadFailed": "Failed to load task list",
+    "tasksToggleFailed": "Failed to toggle task status",
+    "tasksTriggerFailed": "Failed to trigger task",
+    "tasksListTitle": "Tasks",
+    "tasksViewLogs": "View Logs",
+    "views": "Views",
+    "viewsEmpty": "No published views",
+    "viewsEmptyHint": "Click + to create a publish view",
+    "viewsManage": "Manage Views",
+    "viewsLoadFailed": "Failed to load production views",
+    "viewsToggleFailed": "Failed to toggle view status",
+    "viewsListTitle": "Views",
+    "viewsCopyLink": "Copy link",
+    "viewsEdit": "Edit",
+    "viewsDelete": "Delete",
+    "viewsLinkCopied": "Link copied",
+    "viewsCopyFailed": "Copy failed",
+    "viewsCreate": "Create",
+    "viewsCreateTitle": "Create Publish View",
+    "viewsEditTitle": "Edit Publish View",
+    "viewsDeleteTitle": "Delete Publish View?",
+    "viewsDeleteConfirm": "Delete \"{{name}}\"?",
+    "viewsNameLabel": "Name",
+    "viewsNamePlaceholder": "Enter view name",
+    "viewsDescLabel": "Description (optional)",
+    "viewsDescPlaceholder": "Brief description of this view",
+    "viewsModulesLabel": "Module Config",
+    "viewsLinkLabel": "Link",
+    "viewsCreateSuccess": "View created",
+    "viewsUpdateSuccess": "View updated",
+    "viewsDeleteSuccess": "View deleted",
+    "viewsSave": "Save",
+    "viewsCancel": "Cancel",
+    "viewsOpenView": "Open View",
+    "viewsSuggestedNames": "Suggested Names",
+    "viewsChatModules": "Chat Modules",
+    "viewsPanelModules": "Additional Panels",
+    "viewsEnabled": "Enabled",
+    "viewsDisabled": "Disabled"
+  },
+  "siteFrame": {
+    "share": "Share",
+    "reload": "Reload site",
+    "openInNewTab": "Open in new tab",
+    "loading": "Loading site...",
+    "loadingSites": "Loading agent sites...",
+    "loadFailed": "Failed to load sites: {{message}}",
+    "loadTimeout": "Site load timed out",
+    "loadTimeoutHint": "The site may still be loading in the background. Try reloading or open it in a new tab.",
+    "traceToCreator": "Trace to creator",
+    "traceToCreatorTooltip": "Switch to the agent that created this site",
+    "notCreator": "Not creator agent",
+    "notCreatorTooltip": "This site was created by another agent. You can operate data but cannot modify site files. Click Trace to switch to the creator agent."
+  },
   "fileTree": {
     "refresh": "Refresh",
     "emptyState": "No files in workspace",
@@ -147,6 +229,11 @@
     "uploadingProgress": "{{percent}}%",
     "downloadZip": "Download ZIP",
     "downloadFailed": "Download failed",
+    "showTree": "Show file tree",
+    "hideTree": "Hide file tree",
+    "closeTab": "Close tab",
+    "moreTabs": "{{count}} more tabs",
+    "noTabsHint": "Pick a file from the tree to preview",
     "contextMenu": {
       "reference": "Reference in chat",
       "rename": "Rename",
@@ -167,7 +254,9 @@
       "pdfLoadFailed": "Failed to load PDF",
       "tableLoadFailed": "Failed to load table file",
       "emptyTable": "The table is empty",
-      "tableTruncated": "Showing {{shown}} of {{total}} rows"
+      "tableTruncated": "Showing {{shown}} of {{total}} rows",
+      "htmlPreview": "Preview",
+      "htmlSource": "Source"
     }
   },
   "tool": {
@@ -221,24 +310,36 @@
     "submit": "Submit"
   },
   "chatView": {
+    "startConversation": "Start Conversation",
+    "startConversationDesc": "Send a message to start chatting",
     "thinking": "Thinking..."
   },
   "commandMenu": {
-    "noMatch": "No matching commands"
+    "noMatch": "No matching commands",
+    "searchPlaceholder": "Search skills..."
   },
   "messageBubble": {
     "expand": "Expand",
     "uploadedImage": "Uploaded image"
   },
   "planView": {
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low",
     "executionPlan": "Execution Plan"
   },
   "sessionSidebar": {
+    "today": "Today",
+    "yesterday": "Yesterday",
+    "earlier": "Earlier",
+    "header": "Sessions",
     "sessions": "Sessions",
     "historySessions": "History Sessions",
     "noSessions": "No sessions"
   },
   "toolCallGroup": {
+    "running": "Running",
+    "failed": "{{count}} failed",
     "input": "Input",
     "output": "Output"
   },
@@ -268,19 +369,38 @@
     "sessions": "Sessions",
     "today": "Today",
     "yesterday": "Yesterday",
-    "earlier": "Earlier"
+    "earlier": "Earlier",
+    "rename": "Rename",
+    "delete": "Delete",
+    "closeToPopover": "Close to popover"
   },
   "chatInterface": {
+    "processingError": "The request could not be processed properly. Please check the Agent or model status and try again.",
+    "processingErrorDetail": "The request could not be processed properly (stopReason: {{stopReason}}, inputTokens: {{inputTokens}}, outputTokens: {{outputTokens}}). Please check the Agent or model status and try again.",
     "newThread": "New Thread",
     "agentPlaceholder": "Send a message to the agent...",
     "waitingSession": "Waiting for session...",
     "readonlyMode": "Read-only mode — cannot send messages"
+  },
+  "chatHeader": {
+    "newSession": "New Session",
+    "searchPlaceholder": "Search history sessions...",
+    "noResults": "No matching sessions",
+    "refresh": "Refresh sessions",
+    "showSessions": "Show sessions panel",
+    "hideSessions": "Hide sessions panel",
+    "pinSessions": "Pin sessions panel",
+    "unpinSessions": "Unpin sessions panel"
   },
   "chatMessage": {
     "you": "You",
     "agent": "Agent"
   },
   "contextPanel": {
+    "unknownModel": "Unknown",
+    "input": "Input",
+    "output": "Output",
+    "defaultSession": "Default",
     "showContext": "Show context panel",
     "hideContext": "Hide context panel",
     "running": "Running",
@@ -300,6 +420,7 @@
     "empty": "No items"
   },
   "todoPanel": {
+    "collapse": "Collapse",
     "completed": "completed",
     "inProgress": "in progress"
   },
@@ -314,11 +435,90 @@
   "metaAgent": {
     "title": "Meta Agent",
     "history_title": "Session History",
-    "history_today": "Today",
-    "history_yesterday": "Yesterday",
-    "history_earlier": "Earlier",
     "history_empty": "No sessions",
     "history_untitled": "Untitled",
-    "chat_collapse": "Collapse Panel"
+    "chat_collapse": "Collapse Panel",
+    "chat_expand": "Expand Panel"
+  },
+  "chatComposer": {
+    "send": "Send",
+    "stop": "Stop",
+    "newSession": "New Thread",
+    "hint": "Enter to send, Shift+Enter for newline · Paste image or type @ to reference file",
+    "skillButton": "Skill",
+    "fileButton": "File",
+    "uploadingFiles": "Uploading {{count}} files…"
+  },
+  "chatEmpty": {
+    "startConversation": "Start Conversation",
+    "startConversationDesc": "Send a message to start chatting with the ACP agent",
+    "skills": "Loaded Skills",
+    "skillsHint": "Type / to open skill menu",
+    "noSkills": "No skills bound"
+  },
+  "agentBadge": {
+    "enterChat": "Enter Chat",
+    "edit": "Edit",
+    "statusRunning": "Running",
+    "statusStopped": "Stopped"
+  },
+  "orgSwitchFailed": "Failed to switch organization",
+  "imagePreview": {
+    "zoomIn": "Zoom In",
+    "zoomOut": "Zoom Out",
+    "reset": "Reset"
+  },
+  "hindsightToolCard": {
+    "failed": "Failed"
+  },
+  "statusBadge": {
+    "configured": "Configured",
+    "enabled": "Enabled",
+    "unconfigured": "Unconfigured",
+    "disabled": "Disabled",
+    "builtin": "Built-in",
+    "custom": "Custom",
+    "primaryModel": "Primary Model",
+    "subAgent": "Sub-Agent",
+    "all": "All"
+  },
+  "dataTable": {
+    "actions": "Actions",
+    "noData": "No data",
+    "searchPlaceholder": "Search...",
+    "pagination": "{{start}}-{{end}} of {{total}}"
+  },
+  "confirmDialog": {
+    "confirm": "Confirm",
+    "cancel": "Cancel",
+    "processing": "Processing..."
+  },
+  "formDialog": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "saving": "Saving..."
+  },
+  "batchActionBar": {
+    "selected": "{{count}} items selected",
+    "clear": "Clear"
+  },
+  "datePicker": {
+    "placeholder": "Select date"
+  },
+  "toolCallRow": {
+    "viewParams": "View Parameters",
+    "previewFile": "Preview {{path}}",
+    "openFile": "Open File",
+    "toolName": "Tool"
+  },
+  "permissionPanel": {
+    "allow": "Allow",
+    "deny": "Deny"
+  },
+  "sessionModeSelector": {
+    "default": "Default"
+  },
+  "modelIconMap": {
+    "qwen": "Qwen / Tongyi Qianwen"
   }
 }

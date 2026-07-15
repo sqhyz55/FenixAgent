@@ -6,10 +6,28 @@
  */
 
 import { parse as yamlParse } from "yaml";
-import type { NodeDef, NodeType, WorkflowDef } from "../types/dag";
+import type { CustomNodeRegistry } from "../plugins/registry";
+import type { CustomNodeDef, EndNodeDef, NodeDef, NodeType, WorkflowDef } from "../types/dag";
 import { WorkflowError, WorkflowErrorCode } from "../types/errors";
 
-const VALID_NODE_TYPES: NodeType[] = ["shell", "python", "agent", "api", "audit", "workflow", "loop", "transform"];
+const VALID_NODE_TYPES: NodeType[] = [
+  "shell",
+  "python",
+  "agent",
+  "api",
+  "audit",
+  "workflow",
+  "loop",
+  "transform",
+  "custom",
+  "end",
+];
+
+/** parseWorkflowYaml 的额外选项 */
+export interface ParseOptions {
+  /** CustomNodeRegistry 实例，用于校验 tool 存在性 + produces 匹配 */
+  customRegistry?: CustomNodeRegistry;
+}
 
 /**
  * 将 YAML 源码解析为 WorkflowDef
@@ -17,7 +35,7 @@ const VALID_NODE_TYPES: NodeType[] = ["shell", "python", "agent", "api", "audit"
  * @param baseDir 工作流定义所在目录，默认 process.cwd()
  * @throws WorkflowError(INVALID_YAML) 格式错误
  */
-export function parseWorkflowYaml(source: string, baseDir?: string): WorkflowDef {
+export function parseWorkflowYaml(source: string, baseDir?: string, opts?: ParseOptions): WorkflowDef {
   let doc: unknown;
   try {
     doc = yamlParse(source);
@@ -68,7 +86,15 @@ export function parseWorkflowYaml(source: string, baseDir?: string): WorkflowDef
     throw new WorkflowError("Missing required field: 'nodes' (must be an array)", WorkflowErrorCode.INVALID_YAML);
   }
 
-  const nodes: NodeDef[] = raw.nodes.map((n: unknown, i: number) => parseNode(n, i));
+  const nodes: NodeDef[] = raw.nodes.map((n: unknown, i: number) => parseNode(n, i, opts));
+
+  // end 节点全局唯一性校验
+  const endNodes = nodes.filter((n) => n.type === "end");
+  if (endNodes.length > 1) {
+    throw new Error(
+      `Workflow 最多允许一个 end 节点，当前定义了 ${endNodes.length} 个：${endNodes.map((n) => n.id).join(", ")}`,
+    );
+  }
 
   // 识别隐式起始节点：无 depends_on 或 depends_on 为空数组
   const startNodes = nodes.filter((n) => !n.depends_on || n.depends_on.length === 0);
@@ -89,7 +115,7 @@ export function parseWorkflowYaml(source: string, baseDir?: string): WorkflowDef
 /**
  * 解析单个节点定义
  */
-function parseNode(raw: unknown, index: number): NodeDef {
+function parseNode(raw: unknown, index: number, opts?: ParseOptions): NodeDef {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new WorkflowError(`nodes[${index}] must be a mapping`, WorkflowErrorCode.INVALID_YAML);
   }
@@ -117,6 +143,7 @@ function parseNode(raw: unknown, index: number): NodeDef {
     condition: typeof n.condition === "string" ? n.condition : undefined,
     timeout: typeof n.timeout === "number" ? n.timeout : undefined,
     env: isRecord(n.env) ? (n.env as Record<string, string>) : undefined,
+    outputs: parseOutputs(n.outputs),
   };
 
   switch (type) {
@@ -251,7 +278,184 @@ function parseNode(raw: unknown, index: number): NodeDef {
         output: n.output as Record<string, string>,
       };
     }
+    case "custom": {
+      if (!("tool" in n) || typeof n.tool !== "string" || !n.tool.trim()) {
+        throw new WorkflowError(
+          `nodes[${index}] (${n.id}): custom node requires 'tool'`,
+          WorkflowErrorCode.INVALID_YAML,
+        );
+      }
+      const registry = opts?.customRegistry;
+      const toolDef = registry?.get(n.tool);
+      if (registry && !toolDef) {
+        throw new WorkflowError(
+          `nodes[${index}] (${n.id}): custom tool '${n.tool}' not registered`,
+          WorkflowErrorCode.INVALID_YAML,
+        );
+      }
+      if (!n.outputs || !isRecord(n.outputs)) {
+        throw new WorkflowError(
+          `nodes[${index}] (${n.id}): custom node requires 'outputs' mapping`,
+          WorkflowErrorCode.INVALID_YAML,
+        );
+      }
+      if (toolDef) {
+        // produces 含 "*" 表示通配符工具（如通用 slurm 工具），跳过严格校验，
+        // outputs key 完全由用户在 YAML 声明，适配任意脚本产物
+        const allowsAnyOutput = toolDef.produces.includes("*");
+        if (!allowsAnyOutput) {
+          const producesSet = new Set(toolDef.produces);
+          for (const key of Object.keys(base.outputs ?? {})) {
+            if (!producesSet.has(key)) {
+              throw new WorkflowError(
+                `nodes[${index}] (${n.id}): output '${key}' not declared in tool '${n.tool}' produces list [${toolDef.produces.join(", ")}]`,
+                WorkflowErrorCode.INVALID_YAML,
+              );
+            }
+          }
+        }
+      }
+      // 根据 tool kind 判断是否允许/要求 script 字段
+      const isSlurmTool = toolDef?.kind === "slurm";
+
+      if (isSlurmTool) {
+        // SlurmNode 子类: script 必填
+        if (n.script === undefined || n.script === null) {
+          throw new WorkflowError(
+            `nodes[${index}] (${n.id}): slurm tool '${n.tool}' requires 'script.content'`,
+            WorkflowErrorCode.INVALID_YAML,
+          );
+        }
+      } else if (n.script !== undefined && n.script !== null) {
+        // 非 SlurmNode 工具: 禁止 script 字段,避免用户误用
+        throw new WorkflowError(
+          `nodes[${index}] (${n.id}): non-slurm tool '${n.tool}' does not support 'script' field`,
+          WorkflowErrorCode.INVALID_YAML,
+        );
+      }
+      return {
+        ...base,
+        type: "custom",
+        tool: n.tool as string,
+        inputs: isRecord(n.inputs) ? (n.inputs as Record<string, string>) : undefined,
+        // 透传 YAML slurm: 字段（partition/cores/memory/walltime/modules 等），
+        // 由 custom-executor 注入到 ExecuteContext.slurm，SlurmNode 合并到默认配置
+        slurm: parseSlurmConfig(n.slurm),
+        script: parseScriptConfig(n.script, n.id as string),
+        foreach: typeof n.foreach === "string" ? n.foreach : undefined,
+        maxConcurrent: typeof n.maxConcurrent === "number" ? n.maxConcurrent : undefined,
+        continueOnError: typeof n.continueOnError === "boolean" ? n.continueOnError : undefined,
+      };
+    }
+    case "end":
+      // end 节点：声明式最终输出收集器
+      return {
+        ...base,
+        type: "end",
+        inputs: isRecord(n.inputs) ? (n.inputs as Record<string, string>) : undefined,
+      } as EndNodeDef;
   }
+}
+
+/** 解析 outputs 字段为 { pattern, type } 结构 */
+function parseOutputs(raw: unknown): Record<string, { pattern: string; type: "file" | "file-list" | "dir" }> {
+  if (!isRecord(raw)) return {};
+  const result: Record<string, { pattern: string; type: "file" | "file-list" | "dir" }> = {};
+  for (const [key, val] of Object.entries(raw)) {
+    if (!isRecord(val)) {
+      throw new WorkflowError(
+        `outputs.${key}: must be a mapping with 'pattern' and 'type'`,
+        WorkflowErrorCode.INVALID_YAML,
+      );
+    }
+    const pattern = typeof val.pattern === "string" ? val.pattern : "";
+    const type =
+      typeof val.type === "string" && ["file", "file-list", "dir"].includes(val.type)
+        ? (val.type as "file" | "file-list" | "dir")
+        : "file";
+    result[key] = { pattern, type };
+  }
+  return result;
+}
+
+/**
+ * 解析 custom 节点的 slurm: 字段为 Partial<SlurmConfig>。
+ * 字段全可选，未声明返回 undefined（沿用工具默认资源）。
+ * 类型不匹配的字段会被忽略并 warn，避免 YAML 笔误导致整个解析失败。
+ */
+function parseSlurmConfig(raw: unknown): CustomNodeDef["slurm"] {
+  if (!isRecord(raw)) return;
+  const result: NonNullable<CustomNodeDef["slurm"]> = {};
+
+  if (typeof raw.partition === "string") result.partition = raw.partition;
+  if (typeof raw.cores === "number") {
+    result.cores = raw.cores;
+  } else if (typeof raw.cores === "string" && raw.cores.trim() !== "") {
+    // 宽容处理 YAML 的 "4" 字符串写法
+    const parsed = Number.parseInt(raw.cores, 10);
+    if (!Number.isNaN(parsed)) result.cores = parsed;
+  }
+  if (typeof raw.nodes === "number") result.nodes = raw.nodes;
+  if (typeof raw.memory === "string") result.memory = raw.memory;
+  if (typeof raw.walltime === "string") result.walltime = raw.walltime;
+  if (Array.isArray(raw.modules)) {
+    result.modules = raw.modules.filter((m): m is string => typeof m === "string");
+  }
+  if (typeof raw.jobName === "string") result.jobName = raw.jobName;
+  if (Array.isArray(raw.extraSBATCH)) {
+    result.extraSBATCH = raw.extraSBATCH.filter((m): m is string => typeof m === "string");
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+/**
+ * 解析 custom 节点的 script: 字段为 { content, env }。
+ * 仅 tool 是 SlurmNode 子类时由 parseNode 调用。
+ *
+ * 校验:
+ * - content 必须是非空字符串,否则抛 INVALID_YAML(含节点 id + 字段路径)
+ * - env 若声明必须是 Record<string, string>,value 非字符串时 warn 并跳过(宽容处理)
+ * - 字段全缺失时返回 undefined(但 SlurmNode 子类的 parseNode 会要求 content 必填)
+ */
+function parseScriptConfig(raw: unknown, nodeId: string): CustomNodeDef["script"] {
+  if (raw === undefined || raw === null) return;
+  if (!isRecord(raw)) {
+    throw new WorkflowError(
+      `nodes (${nodeId}): 'script' must be a mapping with 'content' and optional 'env'`,
+      WorkflowErrorCode.INVALID_YAML,
+    );
+  }
+
+  // content: 必须是非空字符串(先校验,通过后才初始化 result 以避免占位值)
+  if (typeof raw.content !== "string" || !raw.content.trim()) {
+    throw new WorkflowError(
+      `nodes (${nodeId}): 'script.content' is required and must be a non-empty string`,
+      WorkflowErrorCode.INVALID_YAML,
+    );
+  }
+  const result: NonNullable<CustomNodeDef["script"]> = { content: raw.content };
+
+  // env: 可选,必须是 Record<string, string>,value 非字符串时 warn 并跳过
+  if (raw.env !== undefined && raw.env !== null) {
+    if (!isRecord(raw.env)) {
+      throw new WorkflowError(
+        `nodes (${nodeId}): 'script.env' must be a mapping of string -> string`,
+        WorkflowErrorCode.INVALID_YAML,
+      );
+    }
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw.env)) {
+      if (typeof v !== "string") {
+        console.warn(`[yaml-parser] nodes (${nodeId}): script.env['${k}'] is not a string, skipping`);
+        continue;
+      }
+      env[k] = v;
+    }
+    if (Object.keys(env).length > 0) result.env = env;
+  }
+
+  return result;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

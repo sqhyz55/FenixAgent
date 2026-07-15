@@ -60,6 +60,16 @@ export const registryHeartbeatRegistry = createStubRegistry("registryHeartbeat",
 // ../services/environment — 环境服务，1 个测试文件使用
 export const environmentServiceRegistry = createStubRegistry("environmentService", false);
 
+// ../services/knowledge-base — 知识库服务，外部只读接口使用
+export const knowledgeBaseServiceRegistry = createStubRegistry("knowledgeBaseService", false);
+
+// ../services/workflow/pg-storage-adapter — PG 存储适配器，1 个测试文件使用
+export const pgStorageAdapterRegistry = createStubRegistry("pgStorageAdapter", false);
+
+// ../services/workflow/custom-tools — CustomNode 工具注册表（getCustomToolsRegistry）
+// 路由测试通过 stubCustomTools({ getCustomToolsRegistry: () => ... }) 配置可控返回值
+export const customToolsRegistry = createStubRegistry("customTools", false);
+
 // ../repositories/environment — 环境仓储（对象导出），1 个测试文件使用
 // biome-ignore lint/suspicious/noExplicitAny: repo stub 需要宽松类型
 let _environmentRepoStub: Record<string, any> | null = null;
@@ -93,6 +103,9 @@ export const stubWorkflowTriggerService = workflowTriggerServiceRegistry.stub;
 export const stubRegistry = registryRegistry.stub;
 export const stubRegistryHeartbeat = registryHeartbeatRegistry.stub;
 export const stubEnvironmentService = environmentServiceRegistry.stub;
+export const stubKnowledgeBaseService = knowledgeBaseServiceRegistry.stub;
+export const stubPgStorageAdapter = pgStorageAdapterRegistry.stub;
+export const stubCustomTools = customToolsRegistry.stub;
 
 // ── 重置函数 ──
 
@@ -114,4 +127,7 @@ export function resetModuleStubs() {
   registryRegistry.reset();
   registryHeartbeatRegistry.reset();
   environmentServiceRegistry.reset();
+  knowledgeBaseServiceRegistry.reset();
+  pgStorageAdapterRegistry.reset();
+  customToolsRegistry.reset();
 }

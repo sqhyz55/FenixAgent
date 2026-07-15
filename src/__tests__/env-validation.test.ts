@@ -11,7 +11,6 @@ describe("env validation", () => {
     delete process.env.RCS_PORT;
     delete process.env.RCS_CORS_ORIGIN;
     delete process.env.RCS_TRUSTED_ORIGINS;
-    delete process.env.RCS_S3_ENABLED;
     delete process.env.SKILL_DIR;
     delete process.env.APP_BRAND_NAME;
     delete process.env.APP_LOGO_PATH;
@@ -49,7 +48,6 @@ describe("env validation", () => {
     expect(env.RCS_HOST).toBe("0.0.0.0");
     expect(env.RCS_CORS_ORIGIN).toBe("*");
     expect(env.RCS_TRUSTED_ORIGINS).toBe("");
-    expect(env.RCS_S3_ENABLED).toBe(false);
     expect(env.SKILL_DIR).toBe("./data/skills");
     expect(env.APP_BRAND_NAME).toBe("Fenix");
     expect(env.APP_LOGO_PATH).toBe("");
@@ -60,5 +58,48 @@ describe("env validation", () => {
     process.env.RCS_API_KEYS = "test-key";
     process.env.RCS_PORT = "not-a-number";
     expect(() => validateEnv()).toThrow(/RCS_PORT/);
+  });
+
+  // RCS_DEFAULT_MACHINE_ID 不设置时通过校验（optional）
+  test("RCS_DEFAULT_MACHINE_ID 不设置时通过校验", () => {
+    process.env.DATABASE_URL = "postgres://u:p@h:5432/db";
+    process.env.RCS_API_KEYS = "test-key";
+    delete process.env.RCS_DEFAULT_MACHINE_ID;
+    const env = validateEnv();
+    expect(env.RCS_DEFAULT_MACHINE_ID).toBeUndefined();
+  });
+
+  // 设置合法 mach_ 前缀值时应通过校验
+  test("RCS_DEFAULT_MACHINE_ID 合法值时通过校验", () => {
+    process.env.DATABASE_URL = "postgres://u:p@h:5432/db";
+    process.env.RCS_API_KEYS = "test-key";
+    process.env.RCS_DEFAULT_MACHINE_ID = "mach_abc123";
+    const env = validateEnv();
+    expect(env.RCS_DEFAULT_MACHINE_ID).toBe("mach_abc123");
+  });
+
+  // 设置非法值（不以 mach_ 开头）时应校验失败
+  test("RCS_DEFAULT_MACHINE_ID 不以 mach_ 开头时校验失败", () => {
+    process.env.DATABASE_URL = "postgres://u:p@h:5432/db";
+    process.env.RCS_API_KEYS = "test-key";
+    process.env.RCS_DEFAULT_MACHINE_ID = "invalid-id";
+    expect(() => validateEnv()).toThrow(/RCS_DEFAULT_MACHINE_ID/);
+  });
+
+  // RCS_DEFAULT_ENGINE_TYPE 合法值
+  test("RCS_DEFAULT_ENGINE_TYPE 合法值 'ccb' 通过校验", () => {
+    process.env.DATABASE_URL = "postgres://u:p@h:5432/db";
+    process.env.RCS_API_KEYS = "test-key";
+    process.env.RCS_DEFAULT_ENGINE_TYPE = "ccb";
+    const env = validateEnv();
+    expect(env.RCS_DEFAULT_ENGINE_TYPE).toBe("ccb");
+  });
+
+  // RCS_DEFAULT_ENGINE_TYPE 非法值
+  test("RCS_DEFAULT_ENGINE_TYPE 非法值时校验失败", () => {
+    process.env.DATABASE_URL = "postgres://u:p@h:5432/db";
+    process.env.RCS_API_KEYS = "test-key";
+    process.env.RCS_DEFAULT_ENGINE_TYPE = "invalid-engine";
+    expect(() => validateEnv()).toThrow(/RCS_DEFAULT_ENGINE_TYPE/);
   });
 });

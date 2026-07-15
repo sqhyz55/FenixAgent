@@ -1,9 +1,9 @@
 import { useNavigate } from "@tanstack/react-router";
 import { PanelRight } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { ThreadEntry } from "../../../src/lib/types";
-import { StatusHeader } from "../../components/agent-panel/StatusHeader";
+import { usePanelRef } from "react-resizable-panels";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { AgentFormDialog } from "./AgentFormDialog";
 import { AgentSidebar } from "./AgentSidebar";
 import { ArtifactsPanel } from "./ArtifactsPanel";
@@ -18,43 +18,30 @@ interface AgentAppShellProps {
 export function AgentAppShell({ agentId, sessionId }: AgentAppShellProps) {
   const navigate = useNavigate();
   const { t } = useTranslation("agentPanel");
-  const [_selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
+  const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(agentId);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(sessionId ?? null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
 
-  // Listen for stats broadcast from ChatInterface
-  const [stats, setStats] = useState<{ agentName?: string; modelName?: string; entries: ThreadEntry[] }>({
-    entries: [],
-  });
-
-  useEffect(() => {
-    const handler = (e: Event) => {
-      setStats((e as CustomEvent).detail);
-    };
-    window.addEventListener("chat:stats", handler);
-    return () => window.removeEventListener("chat:stats", handler);
-  }, []);
-
-  const [artifactsCollapsed, setArtifactsCollapsed] = useState(() => {
-    const saved = localStorage.getItem("agent-panel:artifacts-collapsed");
-    return saved === "true";
-  });
+  // ArtifactsPanel 对应的 ResizablePanel imperative handle，由 toggle 按钮调用 collapse/expand
+  const artifactsPanelRef = usePanelRef();
+  const artifactsCollapsedRef = useRef(true);
+  const [artifactsCollapsed, setArtifactsCollapsed] = useState(true);
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 768px)");
     const handler = (e: MediaQueryListEvent) => {
-      if (e.matches) {
-        setArtifactsCollapsed(true);
-      }
+      if (e.matches) artifactsPanelRef.current?.collapse();
     };
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
-  }, []);
+  }, [artifactsPanelRef]);
 
   useEffect(() => {
-    localStorage.setItem("agent-panel:artifacts-collapsed", String(artifactsCollapsed));
-  }, [artifactsCollapsed]);
+    setSelectedAgentId(agentId);
+    setCurrentSessionId(sessionId ?? null);
+    setSelectedInstanceId(null);
+  }, [agentId, sessionId]);
 
   const handleSelectInstance = useCallback(
     (instanceId: string, envId: string, newSessionId: string | null) => {
@@ -72,46 +59,78 @@ export function AgentAppShell({ agentId, sessionId }: AgentAppShellProps) {
 
   const handleNavigate = useCallback(
     (pageId: string) => {
-      if (pageId === "dashboard") {
-        void navigate({ to: "/" });
-      } else if (pageId === "apikeys") {
-        void navigate({ to: "/agent/apikeys" });
-      } else {
-        void navigate({ to: `/${pageId}` });
-      }
+      void navigate({ to: `/agent/${pageId}` as never });
     },
     [navigate],
   );
+
+  // Panel.onResize 同步折叠状态（仅在翻转时触发，避免拖拽中频繁 re-render）
+  const handleArtifactsResize = useCallback(() => {
+    const panel = artifactsPanelRef.current;
+    if (!panel) return;
+    const collapsed = panel.isCollapsed();
+    if (collapsed !== artifactsCollapsedRef.current) {
+      artifactsCollapsedRef.current = collapsed;
+      setArtifactsCollapsed(collapsed);
+    }
+  }, [artifactsPanelRef]);
+
+  const toggleArtifacts = useCallback(() => {
+    const panel = artifactsPanelRef.current;
+    if (!panel) return;
+    if (panel.isCollapsed()) {
+      panel.expand();
+    } else {
+      panel.collapse();
+    }
+  }, [artifactsPanelRef]);
 
   return (
     <div className="agent-panel-layout">
       <AgentSidebar
         activeNav={null}
+        selectedInstanceId={selectedInstanceId}
+        selectedEnvironmentId={selectedAgentId}
         onSelectInstance={handleSelectInstance}
         onNavigate={handleNavigate}
         onCreateAgent={() => setCreateDialogOpen(true)}
       />
       <div className="agent-panel-body">
-        <StatusHeader agentName={stats.agentName} modelName={stats.modelName} entries={stats.entries} />
         <div className="agent-panel-content">
-          <div className="agent-chat-area">
-            <ChatPanel agentId={selectedAgentId} sessionId={currentSessionId} />
-          </div>
-          <ArtifactsPanel
-            collapsed={artifactsCollapsed}
-            onToggleCollapse={() => setArtifactsCollapsed(!artifactsCollapsed)}
-            envId={selectedAgentId}
-          />
-          {artifactsCollapsed && (
-            <button
-              type="button"
-              className="agent-artifacts-expand-btn"
-              onClick={() => setArtifactsCollapsed(false)}
-              title={t("showArtifacts")}
+          <ResizablePanelGroup orientation="horizontal" className="agent-panel-resizable">
+            <ResizablePanel defaultSize="60%" minSize="30%">
+              <div className="agent-chat-area">
+                <ChatPanel agentId={selectedAgentId} sessionId={currentSessionId} />
+              </div>
+            </ResizablePanel>
+
+            <ResizableHandle>
+              <button
+                type="button"
+                className={`agent-artifacts-expand-btn${artifactsCollapsed ? "" : " open"}`}
+                onClick={toggleArtifacts}
+                title={artifactsCollapsed ? t("showArtifacts") : t("hideArtifacts")}
+              >
+                {artifactsCollapsed ? (
+                  <PanelRight className="h-3.5 w-3.5" />
+                ) : (
+                  <PanelRight className="h-3.5 w-3.5 -scale-x-100" />
+                )}
+              </button>
+            </ResizableHandle>
+
+            <ResizablePanel
+              panelRef={artifactsPanelRef}
+              defaultSize="40%"
+              minSize="20%"
+              maxSize="70%"
+              collapsible
+              collapsedSize="0%"
+              onResize={handleArtifactsResize}
             >
-              <PanelRight className="h-3.5 w-3.5" />
-            </button>
-          )}
+              <ArtifactsPanel envId={selectedAgentId} />
+            </ResizablePanel>
+          </ResizablePanelGroup>
         </div>
       </div>
       <AgentFormDialog open={createDialogOpen} onOpenChange={setCreateDialogOpen} mode="create" />

@@ -1,42 +1,84 @@
 import Elysia from "elysia";
+import * as z from "zod/v4";
 import { authGuardPlugin } from "../../plugins/auth";
-import { DeleteInstanceResponseSchema, SpawnInstanceFromEnvironmentRequestSchema } from "../../schemas/instance.schema";
+import { WebErrSchema, WebOkSchema } from "../../schemas/common.schema";
+import {
+  InstanceActivityListResponseSchema,
+  SpawnInstanceFromEnvironmentRequestSchema,
+  SpawnInstanceFromEnvironmentResponseSchema,
+} from "../../schemas/instance.schema";
+import { listInstanceActivitySnapshots } from "../../services/acp-idle-monitor";
 import { getCoreRuntime } from "../../services/core-bootstrap";
 import { getOwnedEnvironment } from "../../services/environment";
-import { spawnInstanceFromEnvironment, stopInstance } from "../../services/instance";
+import { spawnInstanceFromEnvironment, stopInstance, toInstanceInfo } from "../../services/instance";
 
 const app = new Elysia({ name: "web-instances" }).use(authGuardPlugin).model({
+  "instance-activity-list-response": InstanceActivityListResponseSchema,
   "spawn-instance-request": SpawnInstanceFromEnvironmentRequestSchema,
-  "delete-instance-response": DeleteInstanceResponseSchema,
+  "spawn-instance-response": SpawnInstanceFromEnvironmentResponseSchema,
 });
+
+/** GET /web/instances/activity — 查看当前 ACP 实例活跃度与空闲回收状态 */
+app.get(
+  "/instances/activity",
+  // biome-ignore lint/suspicious/noExplicitAny: Elysia 在 response schema + error 分支组合下类型推断不稳定
+  async ({ store }: any) => {
+    const authCtx = store.authContext!;
+    return { success: true as const, data: listInstanceActivitySnapshots(Date.now(), authCtx.organizationId) };
+  },
+  {
+    sessionAuth: true,
+    response: InstanceActivityListResponseSchema,
+    detail: {
+      tags: ["Instances"],
+      summary: "查看 ACP 实例活跃度",
+      description:
+        "返回当前组织下活跃实例的 ACP 连接观测数据，包括最近业务活跃时间、relay 数量、空闲时长，以及是否满足空闲回收或无 ACP 活动硬超时回收条件。",
+    },
+  },
+);
 
 /** POST /web/instances/from-environment — 为环境启动新实例 */
 app.post(
   "/instances/from-environment",
-  async ({ store, body, error }) => {
+  // biome-ignore lint/suspicious/noExplicitAny: Elysia 在 response schema + error 分支组合下类型推断不稳定
+  async ({ store, body, error }: any) => {
     const user = store.user!;
     const authCtx = store.authContext!;
     const b = body as { environmentId: string };
 
     try {
-      await getOwnedEnvironment(b.environmentId, authCtx.organizationId);
+      await getOwnedEnvironment(b.environmentId, authCtx.organizationId, user.id);
     } catch (err: unknown) {
       if (err instanceof Error && "code" in err && (err as { code?: string }).code === "NOT_FOUND") {
-        return error(404, { error: { type: "NOT_FOUND", message: (err as Error).message } });
+        return error(404, { success: false, error: { code: "NOT_FOUND", message: (err as Error).message } });
       }
       throw err;
     }
 
     const instance = await spawnInstanceFromEnvironment(user.id, b.environmentId);
-    return { success: true as const, data: instance };
+    return { success: true as const, data: toInstanceInfo(instance) };
   },
-  { sessionAuth: true, body: "spawn-instance-request" },
+  {
+    sessionAuth: true,
+    body: "spawn-instance-request",
+    response: {
+      200: "spawn-instance-response",
+      404: WebErrSchema,
+    },
+    detail: {
+      tags: ["Instances"],
+      summary: "从环境启动实例",
+      description: "基于指定环境创建并启动一个新的运行实例，返回实例的当前状态与关联信息。",
+    },
+  },
 );
 
 /** DELETE /web/instances/:id — 停止并删除实例 */
 app.delete(
   "/instances/:id",
-  async ({ store, params, error }) => {
+  // biome-ignore lint/suspicious/noExplicitAny: Elysia 在 response schema + error 分支组合下类型推断不稳定
+  async ({ store, params, error }: any) => {
     const authCtx = store.authContext!;
     const result = await stopInstance(params.id, authCtx.organizationId);
 
@@ -44,17 +86,29 @@ app.delete(
       const isAlreadyStopped = result.error === "Already stopped";
       if (isAlreadyStopped) {
         getCoreRuntime().deleteInstance(params.id);
-        return { success: true as const, data: { ok: true as const } };
+        return { success: true as const, data: null };
       }
       const status = result.error === "Instance not found" ? 404 : 403;
-      const type = status === 404 ? "NOT_FOUND" : "forbidden";
-      return error(status, { error: { type, message: result.error! } });
+      const code = status === 404 ? "NOT_FOUND" : "FORBIDDEN";
+      return error(status, { success: false, error: { code, message: result.error! } });
     }
 
     getCoreRuntime().deleteInstance(params.id);
-    return { success: true as const, data: { ok: true as const } };
+    return { success: true as const, data: null };
   },
-  { sessionAuth: true },
+  {
+    sessionAuth: true,
+    response: {
+      200: WebOkSchema(z.null().describe("实例删除成功后固定返回 null。")).describe("删除实例响应。"),
+      403: WebErrSchema,
+      404: WebErrSchema,
+    },
+    detail: {
+      tags: ["Instances"],
+      summary: "删除实例",
+      description: "停止并移除指定实例；如果实例已停止，会执行一次清理并返回成功。",
+    },
+  },
 );
 
 export default app;

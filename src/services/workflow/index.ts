@@ -1,88 +1,33 @@
 /**
  * WorkflowEngine 服务单例。
  *
- * 每个 team 缓存一个引擎实例（Map），因为：
+ * 每个 team 缓存一个 (engine + transport) 二元组，因为：
  * - StorageAdapter 按 organizationId 隔离数据，不能跨 organization 共享
+ * - Transport 绑定 organizationId（否则跨组织泄露）
  * - 引擎内部维护 activeRuns Map（取消/审批状态），不能每次请求重建
  *
  * 服务层职责：
- * - 解析环境名称 → 启动实例 → 建立 relay 连接
- * - 提供已就绪的 AgentChannel 给 Transport 层
+ * - 环境解析 → 实例启动 → relay 连接统一由 agent-chat-transport 处理（复用 agent-chat-service）
  * - workflow 结束后统一销毁启动的实例
  */
 
+import { createLogger } from "@fenix/logger";
 import type { Transport, WorkflowEngine } from "@fenix/workflow-engine";
 import { createWorkflowEngine } from "@fenix/workflow-engine";
-import { and, eq } from "drizzle-orm";
-import { db } from "../../db";
-import { environment } from "../../db/schema";
-import { getCoreRuntime } from "../../services/core-bootstrap";
-import { ensureRunning, getRunningInstancesByEnvironment, stopInstance } from "../instance";
-import { type AgentChannel, createAcpTransport, setChannelFactory } from "./acp-transport";
+import { getRunningInstancesByEnvironment, stopInstance } from "../instance";
+import { createAgentChatTransport } from "./agent-chat-transport";
+import { getCustomToolsRegistry } from "./custom-tools";
 import { createPgStorageAdapter } from "./pg-storage-adapter";
 
-// 每个 team 一个引擎实例，lazy 创建
-const engines = new Map<string, WorkflowEngine>();
-let _transport: Transport | null = null;
+const logger = createLogger("wf-service");
 
-/** 获取全局共享的 Transport 单例，注入 ChannelFactory */
-function getTransport(organizationId: string): Transport {
-  if (!_transport) {
-    _transport = createAcpTransport();
-    setChannelFactory(createChannelFactory(organizationId));
-  }
-  return _transport;
+interface TeamRuntime {
+  engine: WorkflowEngine;
+  transport: Transport;
 }
 
-/**
- * 创建 ChannelFactory — 服务层的核心桥接。
- *
- * 流程：envName → DB 查 Environment → ensureRunning 启动实例 → connectInstanceRelay 建立 relay → 返回 AgentChannel
- */
-function createChannelFactory(organizationId: string) {
-  return async (envName: string, options?: { spawnedEnvIds?: Set<string> }): Promise<AgentChannel> => {
-    // 1. 按 name 查 Environment
-    const [envRow] = await db
-      .select({ id: environment.id })
-      .from(environment)
-      .where(and(eq(environment.name, envName), eq(environment.organizationId, organizationId)))
-      .limit(1);
-
-    if (!envRow) throw new Error(`Environment '${envName}' not found`);
-
-    // 2. 确保实例运行
-    const { instance, status } = await ensureRunning("system", envRow.id);
-    if (status === "spawned") {
-      options?.spawnedEnvIds?.add(envRow.id);
-    }
-
-    // 3. 通过 CoreRuntimeFacade 建立 relay 连接
-    const facade = getCoreRuntime();
-    const handle = await facade.connectInstanceRelay({ instanceId: instance.id });
-
-    // 4. 等待 relay ready（handle 内部会等 WS open）
-    if ("ready" in handle && handle.ready instanceof Promise) {
-      await handle.ready;
-    }
-
-    // 5. 适配为 AgentChannel
-    return {
-      send: (message: unknown) => {
-        handle.send(message as { type: string; payload?: unknown });
-      },
-      onMessage: (handler: (msg: Record<string, unknown>) => void) => {
-        if ("onMessage" in handle && typeof (handle as { onMessage?: unknown }).onMessage === "function") {
-          const opencodeHandle = handle as {
-            onMessage: (listener: (msg: Record<string, unknown>) => void) => () => void;
-          };
-          return opencodeHandle.onMessage(handler);
-        }
-        // 没有 onMessage 则返回空 unsub
-        return () => {};
-      },
-    };
-  };
-}
+// 每个 team 一个 (engine, transport) 对，lazy 创建、互相隔离
+const teamRuntimes = new Map<string, TeamRuntime>();
 
 /** workflow 结束后销毁期间启动的实例 */
 export async function cleanupSpawnedEnvironments(envIds: Set<string>, organizationId: string): Promise<void> {
@@ -93,32 +38,40 @@ export async function cleanupSpawnedEnvironments(envIds: Set<string>, organizati
         await stopInstance(inst.id, organizationId);
       }
     } catch (err) {
-      console.error(`[Workflow] Failed to stop environment ${envId}:`, err);
+      logger.error(`Failed to stop environment: envId=${envId}`, err);
     }
   }
 }
 
-/** 获取或创建指定 team 的 WorkflowEngine 实例 */
+/**
+ * 获取或创建指定 team 的 WorkflowEngine 实例。
+ * Transport 按 organizationId 隔离，绝不跨组织复用。
+ * Agent 通信复用 agent-chat-service（createAgentSession + startPromptTurn），
+ * 不再有独立的 ACP 协议栈。
+ */
 export function getTeamEngine(organizationId: string): WorkflowEngine {
-  let engine = engines.get(organizationId);
-  if (!engine) {
+  let runtime = teamRuntimes.get(organizationId);
+  if (!runtime) {
+    const transport = createAgentChatTransport(organizationId);
     const storage = createPgStorageAdapter(organizationId);
-    engine = createWorkflowEngine({
+    const engine = createWorkflowEngine({
       storage,
-      transport: getTransport(organizationId),
+      transport,
       hmacSecret: process.env.RCS_WORKFLOW_HMAC_SECRET || crypto.randomUUID(),
+      customRegistry: getCustomToolsRegistry(),
     });
-    engines.set(organizationId, engine);
+    runtime = { engine, transport };
+    teamRuntimes.set(organizationId, runtime);
   }
-  return engine;
+  return runtime.engine;
 }
 
 /** 移除指定 team 的 WorkflowEngine 实例（释放内存） */
 export function removeTeamEngine(organizationId: string): boolean {
-  return engines.delete(organizationId);
+  return teamRuntimes.delete(organizationId);
 }
 
 /** 清理所有缓存的 engine 实例 */
 export function clearAllEngines(): void {
-  engines.clear();
+  teamRuntimes.clear();
 }

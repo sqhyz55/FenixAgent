@@ -35,7 +35,8 @@
     "createConfirm": "Create",
     "tabs": {
       "basic": "Basic",
-      "knowledge": "Knowledge Base"
+      "knowledge": "Knowledge Base",
+      "advanced": "Advanced"
     }
   },
   "templates": {
@@ -48,13 +49,15 @@
     "machine": "Machine",
     "machinePlaceholder": "Select an online machine",
     "machineLocal": "Local (Default)",
+    "engineType": "Engine",
+    "engineTypePlaceholder": "Select engine type",
     "machineValidationError": "Machine is required",
     "model": "Model",
     "modelPlaceholder": "Select model",
     "mode": "Mode",
-    "steps": "Steps (1-200)",
+    "steps": "Steps (1-1000)",
     "stepsHint": "Max thinking steps for the agent. Suggested: 10-30 for simple tasks, 50-100 for complex tasks",
-    "stepsValidationError": "Steps must be between 1-200",
+    "stepsValidationError": "Steps must be between 1-1000",
     "prompt": "Prompt",
     "promptPlaceholder": "Optional, custom agent prompt",
     "description": "Description",
@@ -72,7 +75,10 @@
     "hidden": "Hidden",
     "hiddenTitle": "Hidden from agent list, but still callable via API",
     "disable": "Disabled",
-    "disableTitle": "Agent is completely unavailable, cannot be used in UI or API"
+    "disableTitle": "Agent is completely unavailable, cannot be used in UI or API",
+    "extraLabel": "Extra Config (JSON)",
+    "extraPlaceholder": "Optional, extra config in JSON format, e.g. {\"plugin\": {\"name\": \"...\"}}",
+    "extraValidationError": "Invalid JSON format for extra config"
   },
   "knowledge": {
     "bindTitle": "Bind Knowledge Bases",
@@ -92,6 +98,12 @@
     "tabTitle": "Bind MCP Servers",
     "selectedCount": "{{count}} MCP server(s) selected",
     "noOptions": "No MCP servers available"
+  },
+  "sites": {
+    "tabTitle": "Bind Sites",
+    "selectedCount": "{{count}} site(s) selected",
+    "noOptions": "No sites available — create one on the Sites page first",
+    "toggleList": "Toggle site list"
   },
   "memory": {
     "enableTitle": "Agent Memory",
@@ -118,5 +130,16 @@
     "confirmDesc": "Are you sure you want to delete agent \"{{name}}\"?",
     "success": "Agent deleted",
     "error": "Delete failed: {{message}}"
-  }
+  },
+  "categories": {
+    "all": "All",
+    "general": "General Assistant",
+    "data": "Data Analysis",
+    "search": "Search & Retrieval",
+    "monitor": "Monitoring & Alerting",
+    "code": "Code Assistant",
+    "custom": "Custom"
+  },
+  "loadFailed": "Failed to load agents",
+  "enterFailed": "Failed to enter agent"
 }

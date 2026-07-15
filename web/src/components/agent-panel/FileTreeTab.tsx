@@ -1,11 +1,15 @@
-import { Download, File, FilePlus, Folder, FolderInput, FolderOpen, RefreshCw, Trash2, Upload } from "lucide-react";
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { useRequest } from "ahooks";
+import { Download, Folder, FolderInput, FolderOpen, FolderTree, RefreshCw, Trash2, Upload } from "lucide-react";
+import { forwardRef, type ReactNode, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { ConfirmDialog } from "@/components/config/ConfirmDialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { NodeState, TreeNodeData } from "@/components/ui/tree";
 import { Tree } from "@/components/ui/tree";
-import { fileApi, userFileApi } from "@/src/api/sdk";
+import { fsApi } from "@/src/api/fs";
+import { ApiError, unwrap } from "@/src/api/request";
+import { FileTypeIcon } from "@/src/components/file-icon-helper";
 import { NS } from "../../i18n";
 import { buildPreviewUrl, encodePathSegment } from "./preview/utils";
 
@@ -68,6 +72,37 @@ function parsedToTreeNodeData(node: ParsedNode): TreeNodeData {
   };
 }
 
+/** 工具栏按钮：点击后压制 tooltip，鼠标真正离开再重新进入后才恢复 */
+function ToolbarTip({ label, children }: { label: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const suppressRef = useRef(false);
+
+  return (
+    <Tooltip
+      open={open}
+      onOpenChange={(v) => {
+        if (suppressRef.current && v) return;
+        setOpen(v);
+      }}
+    >
+      <TooltipTrigger asChild>
+        <span
+          onPointerDown={() => {
+            suppressRef.current = true;
+            setOpen(false);
+          }}
+          onPointerEnter={() => {
+            suppressRef.current = false;
+          }}
+        >
+          {children}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 export interface FileTreeTabHandle {
   uploadFiles: (files: File[], onProgress?: (percent: number) => void) => Promise<void>;
 }
@@ -77,40 +112,97 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
   ref,
 ) {
   const { t } = useTranslation(NS.COMPONENTS);
-  const [loading, setLoading] = useState(true);
-  const [refreshKey, setRefreshKey] = useState(0);
+  const { t: tPanel } = useTranslation(NS.AGENT_PANEL);
   const treeDataRef = useRef<ParsedNode[]>([]);
-  const [selectedDir, setSelectedDir] = useState<string | null>(null);
-  const [uploading, setUploading] = useState(false);
+  const [treeVersion, setTreeVersion] = useState(0);
+  const [selectedDir, setSelectedDir] = useState<string | undefined>(undefined);
+  const expandedIdsRef = useRef<Set<string>>(new Set());
   const [deleteConfirm, setDeleteConfirm] = useState<{ path: string; name: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
 
-  const loadTree = useCallback(async () => {
-    if (!envId) return;
-    setLoading(true);
-    const { data, error: err } = await userFileApi.tree({ id: envId });
-    if (err) {
-      console.error("Failed to load file tree:", err);
-      treeDataRef.current = [];
-    } else {
+  // ── 文件树加载 ──
+  const { loading, refresh: refreshTree } = useRequest(() => unwrap(fsApi.tree(envId!)), {
+    ready: !!envId,
+    onSuccess: (data) => {
       const paths = data?.paths ?? [];
       const mtimes = data?.mtimes ?? {};
       // 按文件修改时间倒序排列（最新上传的在前）
-      const sorted = [...paths].sort((a, b) => {
-        const ta = mtimes[a] ?? 0;
-        const tb = mtimes[b] ?? 0;
-        return tb - ta; // 倒序
-      });
+      const sorted = [...paths].sort((a, b) => (mtimes[b] ?? 0) - (mtimes[a] ?? 0));
       treeDataRef.current = parsePathsToTree(sorted);
-    }
-    setLoading(false);
-    setRefreshKey((k) => k + 1);
-  }, [envId]);
+      setTreeVersion((v) => v + 1);
+    },
+    onError: (err) => {
+      console.error("Failed to load file tree:", err);
+      treeDataRef.current = [];
+      setTreeVersion((v) => v + 1);
+    },
+  });
 
-  useEffect(() => {
-    loadTree();
-  }, [loadTree]);
+  // ── 文件上传 ──
+  const { run: runUpload, loading: uploading } = useRequest(
+    (fd: FormData, targetDir?: string) => unwrap(fsApi.upload(envId!, fd, targetDir)),
+    {
+      manual: true,
+      onSuccess: (data) => {
+        toast.success(t("fileTree.uploadSuccess", { count: data.files?.length ?? 0 }));
+        refreshTree();
+      },
+      onError: (err) => {
+        if (err instanceof ApiError && (err as ApiError & { status?: number }).status === 413) {
+          toast.error(t("filePicker.uploadTooLarge"));
+        } else {
+          toast.error(err.message || t("fileTree.uploadFailed"));
+        }
+      },
+    },
+  );
+
+  // ── 重命名 ──
+  const { run: runRename } = useRequest(
+    (oldPath: string, newName: string) => {
+      const parentDir = oldPath.includes("/") ? oldPath.substring(0, oldPath.lastIndexOf("/")) : "";
+      const newPath = parentDir ? `${parentDir}/${newName}` : newName;
+      return unwrap(fsApi.rename(envId!, oldPath, newPath));
+    },
+    {
+      manual: true,
+      onSuccess: () => refreshTree(),
+      onError: (err) => console.error("Rename failed:", err),
+    },
+  );
+
+  // ── 删除 ──
+  const { run: runDelete } = useRequest((path: string) => unwrap(fsApi.batchDelete(envId!, [path])), {
+    manual: true,
+    onSuccess: (data) => {
+      const failed = (data as { failed?: Array<{ path: string; error: string }> } | undefined)?.failed;
+      if (failed && failed.length > 0) {
+        toast.error(failed[0].error || t("fileTree.contextMenu.delete"));
+        return;
+      }
+      setDeleteConfirm(null);
+      refreshTree();
+    },
+    onError: (err) => {
+      console.error("Delete failed:", err);
+      toast.error(t("fileTree.contextMenu.delete"));
+    },
+  });
+
+  // ── 创建目录 ──
+  const { run: runMkdir } = useRequest((path: string) => unwrap(fsApi.mkdir(envId!, path)), {
+    manual: true,
+    onSuccess: () => refreshTree(),
+    onError: (err) => console.error("Mkdir failed:", err),
+  });
+
+  // ── 创建新文件 ──
+  const { run: runNewFile } = useRequest((path: string) => unwrap(fsApi.writeFile(envId!, path, "")), {
+    manual: true,
+    onSuccess: () => refreshTree(),
+    onError: (err) => console.error("New file failed:", err),
+  });
 
   useImperativeHandle(
     ref,
@@ -118,7 +210,7 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
       uploadFiles: async (files: File[], onProgress?: (percent: number) => void) => {
         if (!envId || files.length === 0) return;
 
-        const targetDir = selectedDir || "user";
+        const targetDir = selectedDir || "";
         const formData = new FormData();
         for (const file of files) {
           formData.append("files", file);
@@ -126,7 +218,7 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
 
         await new Promise<void>((resolve, reject) => {
           const xhr = new XMLHttpRequest();
-          const url = `/web/environments/${envId}/user/${targetDir}`;
+          const url = targetDir ? `/web/environments/${envId}/fs/${targetDir}` : `/web/environments/${envId}/fs`;
 
           xhr.upload.onprogress = (e) => {
             if (e.lengthComputable && onProgress) {
@@ -148,10 +240,10 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
           xhr.send(formData);
         });
 
-        await loadTree();
+        refreshTree();
       },
     }),
-    [envId, selectedDir, loadTree],
+    [envId, selectedDir, refreshTree],
   );
 
   // 从缓存的 ParsedNode 树中查找指定路径的子节点
@@ -178,7 +270,21 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
     [findChildren],
   );
 
-  /** 单击：目录选中，文件直接预览 */
+  // treeVersion 变化时 Tree 重新挂载，通过 defaultExpandedIds 恢复展开状态
+  const handleToggle = useCallback((nodeId: string, expanded: boolean) => {
+    if (expanded) {
+      expandedIdsRef.current.add(nodeId);
+      // 展开目录时同步更新上传目标，使点击 chevron 和点击行展开行为一致
+      const parsed = findNodeByPath(treeDataRef.current, nodeId);
+      if (parsed?.isDir) {
+        setSelectedDir(nodeId);
+      }
+    } else {
+      expandedIdsRef.current.delete(nodeId);
+    }
+  }, []);
+
+  /** 单击：目录选中，可预览文件触发预览，二进制文件忽略 */
   const handleSelect = useCallback(
     (nodeId: string | null, _node: TreeNodeData) => {
       if (!nodeId) return;
@@ -189,7 +295,8 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
         setSelectedDir(nodeId);
       } else {
         const parentDir = nodeId.substring(0, nodeId.lastIndexOf("/"));
-        setSelectedDir(parentDir || null);
+        setSelectedDir(parentDir || undefined);
+        // office/binary 忽略分类检查，统一交给 @open-file-viewer 插件链处理
         onPreviewFile(nodeId);
       }
     },
@@ -222,53 +329,6 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
     return () => document.removeEventListener("click", close);
   }, [contextMenu]);
 
-  const handleRename = useCallback(async () => {
-    if (!contextMenu || !envId) return;
-    const currentName = contextMenu.path.split("/").pop() ?? "";
-    const newName = window.prompt(t("fileTree.contextMenu.rename"), currentName);
-    if (!newName || newName === currentName) return;
-    const parentDir = contextMenu.path.substring(0, contextMenu.path.lastIndexOf("/"));
-    const newPath = parentDir ? `${parentDir}/${newName}` : newName;
-    const { error: renameErr } = await userFileApi.rename({ id: envId }, { oldPath: contextMenu.path, newPath });
-    if (renameErr) {
-      console.error("Rename failed:", renameErr);
-    } else {
-      loadTree();
-    }
-    setContextMenu(null);
-  }, [contextMenu, envId, loadTree, t]);
-
-  const handleDelete = useCallback(async () => {
-    if (!contextMenu || !envId) return;
-    setDeleteConfirm({ path: contextMenu.path, name: contextMenu.path.split("/").pop() ?? contextMenu.path });
-    setContextMenu(null);
-  }, [contextMenu, envId]);
-
-  const executeDelete = useCallback(async () => {
-    if (!deleteConfirm || !envId) return;
-    const { error: deleteErr } = await userFileApi.batchDelete({ id: envId }, { paths: [deleteConfirm.path] });
-    if (deleteErr) {
-      toast.error(t("fileTree.contextMenu.delete"));
-    } else {
-      loadTree();
-    }
-    setDeleteConfirm(null);
-  }, [deleteConfirm, envId, loadTree, t]);
-
-  const handleNewFolder = useCallback(async () => {
-    if (!contextMenu || !envId) return;
-    const name = window.prompt(t("fileTree.contextMenu.newFolderName"));
-    if (!name) return;
-    const fullPath = `${contextMenu.path}/${name}`;
-    const { error: mkdirErr } = await userFileApi.mkdir({ id: envId }, { path: fullPath });
-    if (mkdirErr) {
-      console.error("Mkdir failed:", mkdirErr);
-    } else {
-      loadTree();
-    }
-    setContextMenu(null);
-  }, [contextMenu, envId, loadTree, t]);
-
   const handleReference = useCallback(() => {
     if (!contextMenu) return;
     const name = contextMenu.path.split("/").pop() || contextMenu.path;
@@ -282,7 +342,9 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = "copy";
+    }
   }, []);
 
   const handleDragEnter = useCallback((e: React.DragEvent) => {
@@ -298,26 +360,28 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
   }, []);
 
   const handleDrop = useCallback(
-    async (e: React.DragEvent) => {
+    (e: React.DragEvent) => {
       e.preventDefault();
-      if (!envId) return;
+      if (!envId || !e.dataTransfer) return;
       const files = Array.from(e.dataTransfer.files);
       if (files.length === 0) return;
 
-      const targetSubdir = selectedDir || "user";
-      try {
-        const formData = new FormData();
-        for (const file of files) {
-          formData.append("files", file);
+      // 客户端提前校验
+      const maxSize = 100 * 1024 * 1024;
+      for (const file of files) {
+        if (file.size > maxSize) {
+          toast.error(t("filePicker.fileTooLarge", { name: file.name, max: "100MB" }));
+          return;
         }
-        await fileApi.upload({ id: envId, path: targetSubdir }, formData);
-        toast.success(t("fileTree.uploadSuccess", { count: files.length }));
-        await loadTree();
-      } catch {
-        toast.error(t("fileTree.uploadFailed"));
       }
+
+      const formData = new FormData();
+      for (const file of files) {
+        formData.append("files", file);
+      }
+      runUpload(formData, selectedDir);
     },
-    [envId, selectedDir, loadTree, t],
+    [envId, runUpload, selectedDir, t],
   );
 
   // 按钮上传文件
@@ -330,81 +394,96 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
     folderInputRef.current?.click();
   }, []);
 
-  const uploadFiles = useCallback(
-    async (files: File[], relativePaths?: string[]) => {
-      if (!envId || files.length === 0) return;
-
-      setUploading(true);
-      try {
-        const targetDir = selectedDir || "user";
-        const formData = new FormData();
-        for (const file of files) {
-          formData.append("files", file);
-        }
-        if (relativePaths && relativePaths.length > 0) {
-          formData.append("relativePaths", JSON.stringify(relativePaths));
-        }
-        const { error: uploadErr } = await fileApi.upload({ id: envId, path: targetDir }, formData);
-        if (uploadErr) {
-          toast.error(t("fileTree.uploadFailed"));
-        } else {
-          toast.success(t("fileTree.uploadSuccess", { count: files.length }));
-          await loadTree();
-        }
-      } catch {
-        toast.error(t("fileTree.uploadFailed"));
-      } finally {
-        setUploading(false);
-      }
-    },
-    [envId, selectedDir, loadTree, t],
-  );
-
   const handleFileInputChange = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (!e.target?.files?.length) {
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        return;
+      }
       const files = e.target.files;
-      if (!files || files.length === 0) return;
-      await uploadFiles(Array.from(files));
+
+      // 客户端提前校验单文件大小
+      const maxSize = 100 * 1024 * 1024;
+      for (const file of Array.from(files)) {
+        if (file.size > maxSize) {
+          toast.error(t("filePicker.fileTooLarge", { name: file.name, max: "100MB" }));
+          if (fileInputRef.current) fileInputRef.current.value = "";
+          return;
+        }
+      }
+
+      const formData = new FormData();
+      for (const file of Array.from(files)) {
+        formData.append("files", file);
+      }
+      runUpload(formData, selectedDir);
       if (fileInputRef.current) fileInputRef.current.value = "";
     },
-    [uploadFiles],
+    [runUpload, selectedDir, t],
   );
 
   const handleFolderInputChange = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (!e.target?.files?.length) {
+        if (folderInputRef.current) folderInputRef.current.value = "";
+        return;
+      }
       const files = e.target.files;
-      if (!files || files.length === 0) return;
+
+      // 客户端提前校验单文件大小
+      const maxSize = 100 * 1024 * 1024;
+      for (const file of Array.from(files)) {
+        if (file.size > maxSize) {
+          toast.error(t("filePicker.fileTooLarge", { name: file.name, max: "100MB" }));
+          if (folderInputRef.current) folderInputRef.current.value = "";
+          return;
+        }
+      }
+
       // webkitRelativePath 保留了文件夹的相对路径结构
       const relativePaths = Array.from(files).map((f) => f.webkitRelativePath || f.name);
-      await uploadFiles(Array.from(files), relativePaths);
+      const formData = new FormData();
+      for (const file of Array.from(files)) {
+        formData.append("files", file);
+      }
+      formData.append("relativePaths", JSON.stringify(relativePaths));
+      runUpload(formData, selectedDir);
       if (folderInputRef.current) folderInputRef.current.value = "";
     },
-    [uploadFiles],
+    [runUpload, selectedDir, t],
   );
 
-  // 下载：文件直接下载，目录打包为 zip（per-item 回调）
+  // 下载：文件直接下载，目录打包为 zip
+  // 使用 fetch + Blob 确保携带认证 cookie；<a download> 无法保证 credentials
   const handleDownload = useCallback(
     async (nodePath: string, isDir: boolean) => {
       if (!envId) return;
       try {
+        let url: string;
+        let fileName: string;
+
         if (isDir) {
-          const url = `/web/environments/${envId}/user-file/download-zip?path=${encodePathSegment(nodePath)}`;
-          const a = document.createElement("a");
-          a.href = url;
           const dirName = nodePath.split("/").filter(Boolean).pop() || "download";
-          a.download = `${dirName}.zip`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
+          url = `/web/environments/${envId}/fs/download-zip?path=${encodePathSegment(nodePath)}`;
+          fileName = `${dirName}.zip`;
         } else {
-          const url = buildPreviewUrl(envId, nodePath);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = nodePath.split("/").pop() || "file";
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
+          url = buildPreviewUrl(envId, nodePath);
+          fileName = nodePath.split("/").pop() || "file";
         }
+
+        const res = await fetch(url, { credentials: "include" });
+        if (!res.ok) {
+          throw new Error(`Download failed: ${res.status}`);
+        }
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
       } catch {
         toast.error(t("fileTree.downloadFailed"));
       }
@@ -420,61 +499,67 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
 
       return (
         <>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              handleDownload(node.id, isDir);
-            }}
-            className="h-5 w-5 flex items-center justify-center rounded text-text-muted hover:text-text-primary"
-            title={isDir ? t("fileTree.downloadZip") : t("fileTree.download")}
-          >
-            <Download className="h-3 w-3" />
-          </button>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              setDeleteConfirm({ path: node.id, name: node.label });
-            }}
-            className="h-5 w-5 flex items-center justify-center rounded text-text-muted hover:text-status-error"
-            title={t("fileTree.contextMenu.delete")}
-          >
-            <Trash2 className="h-3 w-3" />
-          </button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDownload(node.id, isDir);
+                }}
+                className="h-6 w-6 flex items-center justify-center rounded text-text-muted hover:text-text-primary"
+              >
+                <Download className="h-4 w-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{isDir ? t("fileTree.downloadZip") : t("fileTree.download")}</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setDeleteConfirm({ path: node.id, name: node.label });
+                }}
+                className="h-6 w-6 flex items-center justify-center rounded text-text-muted hover:text-status-error"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{t("fileTree.contextMenu.delete")}</TooltipContent>
+          </Tooltip>
         </>
       );
     },
     [handleDownload, t],
   );
 
-  // 新建空文件
-  const handleNewFile = useCallback(async () => {
-    if (!envId) return;
-    const name = window.prompt(t("fileTree.newFileName"));
-    if (!name) return;
-    const parentDir = selectedDir || "user";
-    const fullPath = `${parentDir}/${name}`;
-    const { error: writeErr } = await fileApi.writeFile({ id: envId, path: fullPath }, { content: "" });
-    if (writeErr) {
-      console.error("New file failed:", writeErr);
-    } else {
-      await loadTree();
-    }
-  }, [envId, selectedDir, loadTree, t]);
-
-  // 自定义 label：目录用 FolderOpen 图标，文件用 File 图标（通过 icon prop 已处理）
-  // 但目录展开时切换为 FolderOpen
+  // 自定义 label：目录用 Folder/FolderOpen 图标，文件用 react-file-icon 按扩展名渲染
   const renderLabel = useCallback((node: TreeNodeData, state: NodeState) => {
-    // 查找节点判断是否为目录
     const parsed = findNodeByPath(treeDataRef.current, node.id);
     const isDir = parsed?.isDir ?? false;
 
-    const IconComp = isDir ? (state.expanded ? FolderOpen : Folder) : File;
+    // 目录保持 lucide 图标
+    if (isDir) {
+      const IconComp = state.expanded ? FolderOpen : Folder;
+      return (
+        <span className="flex items-center gap-1.5">
+          <IconComp className="h-5 w-5 flex-shrink-0 text-muted-foreground" />
+          <span className="truncate" title={node.label}>
+            {node.label}
+          </span>
+        </span>
+      );
+    }
 
+    // 文件使用 react-file-icon 按扩展名显示不同图标
+    // ml-6 补偿文件夹 chevron 占位，保持文件图标与文件夹图标左对齐
     return (
-      <span className="flex items-center gap-1.5">
-        <IconComp className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
+      <span className="flex items-center gap-1.5 ml-6">
+        <span className="h-4 w-4 flex-shrink-0 inline-flex items-center justify-center">
+          <FileTypeIcon filename={node.label ?? ""} />
+        </span>
         <span className="truncate" title={node.label}>
           {node.label}
         </span>
@@ -486,55 +571,55 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden h-full">
-      {/* 工具栏 */}
-      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-border flex-shrink-0">
-        <button
-          type="button"
-          onClick={loadTree}
-          disabled={loading || !envId}
-          className="h-7 w-7 flex items-center justify-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors disabled:opacity-50"
-          title={t("fileTree.refresh")}
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
-        </button>
-        <button
-          type="button"
-          onClick={handleUploadClick}
-          disabled={uploading || !envId}
-          className="h-7 w-7 flex items-center justify-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors disabled:opacity-50"
-          title={t("fileTree.upload")}
-        >
-          <Upload className="h-3.5 w-3.5" />
-        </button>
-        <button
-          type="button"
-          onClick={handleFolderUploadClick}
-          disabled={uploading || !envId}
-          className="h-7 w-7 flex items-center justify-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors disabled:opacity-50"
-          title={t("fileTree.uploadFolder")}
-        >
-          <FolderInput className="h-3.5 w-3.5" />
-        </button>
-        <button
-          type="button"
-          onClick={handleNewFile}
-          disabled={!envId}
-          className="h-7 w-7 flex items-center justify-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors disabled:opacity-50"
-          title={t("fileTree.newFile")}
-        >
-          <FilePlus className="h-3.5 w-3.5" />
-        </button>
-        <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={handleFileInputChange} />
-        <input
-          ref={folderInputRef}
-          type="file"
-          multiple
-          style={{ display: "none" }}
-          onChange={handleFolderInputChange}
-          // @ts-expect-error webkitdirectory is non-standard but widely supported
-          webkitdirectory=""
-          directory=""
-        />
+      {/* 标题栏 + 工具按钮合并为一行 */}
+      <div className="flex items-center justify-between px-2 py-1.5 flex-shrink-0">
+        <span className="text-base font-semibold text-text-primary flex items-center gap-1.5">
+          <FolderTree className="h-4 w-4" />
+          {tPanel("tabFiles")}
+        </span>
+        <div className="flex items-center gap-1">
+          <ToolbarTip label={t("fileTree.refresh")}>
+            <button
+              type="button"
+              onClick={refreshTree}
+              disabled={loading || !envId}
+              className="h-7 w-7 flex items-center justify-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+            </button>
+          </ToolbarTip>
+          <ToolbarTip label={t("fileTree.upload")}>
+            <button
+              type="button"
+              onClick={handleUploadClick}
+              disabled={uploading || !envId}
+              className="h-7 w-7 flex items-center justify-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors disabled:opacity-50"
+            >
+              <Upload className="h-4 w-4" />
+            </button>
+          </ToolbarTip>
+          <ToolbarTip label={t("fileTree.uploadFolder")}>
+            <button
+              type="button"
+              onClick={handleFolderUploadClick}
+              disabled={uploading || !envId}
+              className="h-7 w-7 flex items-center justify-center rounded-md text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors disabled:opacity-50"
+            >
+              <FolderInput className="h-4 w-4" />
+            </button>
+          </ToolbarTip>
+          <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={handleFileInputChange} />
+          <input
+            ref={folderInputRef}
+            type="file"
+            multiple
+            style={{ display: "none" }}
+            onChange={handleFolderInputChange}
+            // @ts-expect-error webkitdirectory is non-standard but widely supported
+            webkitdirectory=""
+            directory=""
+          />
+        </div>
       </div>
 
       {/* 文件树 */}
@@ -561,9 +646,11 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
           </div>
         ) : (
           <Tree
-            key={refreshKey}
+            key={treeVersion}
             getChildren={getChildren}
+            defaultExpandedIds={[...expandedIdsRef.current]}
             onSelect={handleSelect}
+            onToggle={handleToggle}
             renderActions={renderActions}
             renderLabel={renderLabel}
           />
@@ -587,7 +674,13 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
             <button
               type="button"
               className="flex w-full items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors text-text-primary hover:bg-surface-2"
-              onClick={handleRename}
+              onClick={() => {
+                const currentName = contextMenu.path.split("/").pop() ?? "";
+                const newName = window.prompt(t("fileTree.contextMenu.rename"), currentName);
+                if (!newName || newName === currentName) return;
+                runRename(contextMenu.path, newName);
+                setContextMenu(null);
+              }}
             >
               {t("fileTree.contextMenu.rename")}
             </button>
@@ -595,7 +688,13 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
           <button
             type="button"
             className="flex w-full items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors text-status-error hover:bg-status-error/10"
-            onClick={handleDelete}
+            onClick={() => {
+              setDeleteConfirm({
+                path: contextMenu.path,
+                name: contextMenu.path.split("/").pop() ?? contextMenu.path,
+              });
+              setContextMenu(null);
+            }}
           >
             {t("fileTree.contextMenu.delete")}
           </button>
@@ -603,7 +702,12 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
             <button
               type="button"
               className="flex w-full items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors text-text-primary hover:bg-surface-2"
-              onClick={handleNewFolder}
+              onClick={() => {
+                const name = window.prompt(t("fileTree.contextMenu.newFolderName"));
+                if (!name) return;
+                runMkdir(`${contextMenu.path}/${name}`);
+                setContextMenu(null);
+              }}
             >
               {t("fileTree.contextMenu.newFolder")}
             </button>
@@ -613,14 +717,9 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
               type="button"
               className="flex w-full items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors text-text-primary hover:bg-surface-2"
               onClick={() => {
-                if (!envId) return;
                 const name = window.prompt(t("fileTree.newFileName"));
                 if (!name) return;
-                const fullPath = `${contextMenu.path}/${name}`;
-                fileApi.writeFile({ id: envId, path: fullPath }, { content: "" }).then(({ error: writeErr }) => {
-                  if (writeErr) console.error("New file failed:", writeErr);
-                  else loadTree();
-                });
+                runNewFile(`${contextMenu.path}/${name}`);
                 setContextMenu(null);
               }}
             >
@@ -638,7 +737,7 @@ export const FileTreeTab = forwardRef<FileTreeTabHandle, FileTreeTabProps>(funct
         title={t("fileTree.contextMenu.delete")}
         description={deleteConfirm?.name ?? ""}
         variant="destructive"
-        onConfirm={executeDelete}
+        onConfirm={() => deleteConfirm && runDelete(deleteConfirm.path)}
         confirmLabel={t("fileTree.contextMenu.delete")}
       />
     </div>

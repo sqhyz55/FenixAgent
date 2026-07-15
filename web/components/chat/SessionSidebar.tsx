@@ -22,7 +22,7 @@ export function SessionSidebar({ sessions, activeId, onSelect, onNew, className 
   const [collapsed, setCollapsed] = useState(false);
 
   // 按日期分组
-  const groups = groupByRecency(sessions);
+  const groups = groupByRecency(sessions, t);
 
   return (
     <div
@@ -34,17 +34,16 @@ export function SessionSidebar({ sessions, activeId, onSelect, onNew, className 
     >
       {/* 头部 */}
       <div className="flex items-center justify-between px-3 py-3 border-b border-border">
-        {!collapsed && (
-          <span className="text-xs font-display font-medium text-text-muted uppercase tracking-wider">
-            {t("sessionSidebar.sessions")}
-          </span>
-        )}
+        <span className="text-xs font-display font-medium text-text-muted uppercase tracking-wider">
+          {t("sessionSidebar.sessions")}
+        </span>
         <div className="flex items-center gap-1">
-          {!collapsed && onNew && (
+          {onNew && (
             <button
               type="button"
               onClick={onNew}
               className="h-7 w-7 flex items-center justify-center rounded-lg text-text-muted hover:text-brand hover:bg-brand/10 transition-colors"
+              title={t("acpMain.newSession")}
             >
               <Plus className="h-4 w-4" />
             </button>
@@ -53,8 +52,9 @@ export function SessionSidebar({ sessions, activeId, onSelect, onNew, className 
             type="button"
             onClick={() => setCollapsed(!collapsed)}
             className="h-7 w-7 flex items-center justify-center rounded-lg text-text-muted hover:text-text-primary hover:bg-surface-2 transition-colors"
+            title={t("sessionSidebar.hideSessions")}
           >
-            {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+            <ChevronLeft className="h-4 w-4" />
           </button>
         </div>
       </div>
@@ -110,15 +110,15 @@ interface SessionGroup {
   sessions: SessionListItem[];
 }
 
-function groupByRecency(sessions: SessionListItem[]): SessionGroup[] {
+function groupByRecency(sessions: SessionListItem[], t: (key: string) => string): SessionGroup[] {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const yesterday = new Date(today.getTime() - 86400000);
 
   const groups: SessionGroup[] = [
-    { label: "今天", sessions: [] },
-    { label: "昨天", sessions: [] },
-    { label: "更早", sessions: [] },
+    { label: t("sessionSidebar.today"), sessions: [] },
+    { label: t("sessionSidebar.yesterday"), sessions: [] },
+    { label: t("sessionSidebar.earlier"), sessions: [] },
   ];
 
   for (const session of sessions) {

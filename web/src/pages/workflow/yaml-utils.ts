@@ -1,5 +1,5 @@
 import type { Edge, Node } from "@xyflow/react";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
 
 export const START_NODE_ID = "__start__";
 
@@ -57,7 +57,7 @@ export function yamlToFlow(yamlStr: string): { nodes: Node[]; edges: Edge[]; met
     description: doc?.description || "",
     timeout: doc?.timeout ?? 300,
     params: doc?.params || {},
-    secrets: doc?.secrets || [],
+    secrets: (doc?.secrets || []).filter(Boolean),
   };
 
   const rawNodes = doc?.nodes || [];
@@ -158,7 +158,7 @@ export function flowToYaml(nodes: Node[], edges: Edge[], meta: WfMeta): string {
     ...(meta.description ? { description: meta.description } : {}),
     timeout: meta.timeout,
     ...(Object.keys(meta.params).length ? { params: meta.params } : {}),
-    ...(meta.secrets.length ? { secrets: meta.secrets } : {}),
+    ...(meta.secrets.filter(Boolean).length ? { secrets: meta.secrets.filter(Boolean) } : {}),
   };
 
   const yamlNodes: Record<string, unknown>[] = [];
@@ -188,10 +188,11 @@ export function flowToYaml(nodes: Node[], edges: Edge[], meta: WfMeta): string {
   }
   doc.nodes = yamlNodes;
 
-  return yaml.dump(doc, { lineWidth: 120, noRefs: true, quotingType: '"' });
+  return yaml.dump(doc, { lineWidth: 120, noRefs: true, quoteStyle: "double" });
 }
 
 let nodeCounter = 0;
+let edgeCounter = 0;
 
 const TYPE_PREFIXES: Record<string, string> = {
   shell: "shell",
@@ -202,6 +203,8 @@ const TYPE_PREFIXES: Record<string, string> = {
   workflow: "wf",
   loop: "loop",
   transform: "tf",
+  custom: "custom",
+  end: "end",
 };
 
 export function nextNodeId(type: string): string {
@@ -211,6 +214,58 @@ export function nextNodeId(type: string): string {
 
 export function resetNodeCounter(): void {
   nodeCounter = 0;
+}
+
+/**
+ * 生成全局唯一 edge ID。
+ *
+ * 不能用 `logic-${source}-${target}` 作为 ID：
+ * - 同一对 source/target 多次连接会冲突，导致 React Flow 内部状态错乱（同 ID 两条 edge）
+ * - YAML 重载后 edge ID 丢失，原本依赖 ID 的逻辑会失效
+ *
+ * 使用自增计数器 + source/target 后缀便于调试，YAML 序列化时 edge ID 不写入（depends_on 从 source/target 推导）。
+ */
+export function nextEdgeId(source: string, target: string): string {
+  edgeCounter += 1;
+  return `e${edgeCounter}_${source}_${target}`;
+}
+
+export function resetEdgeCounter(): void {
+  edgeCounter = 0;
+}
+
+/**
+ * 从已有节点 ID 列表中同步 nodeCounter，防止新节点 ID 与已存在节点冲突。
+ * 加载已有工作流 YAML 后必须调用，否则添加新节点时可能生成重复 ID。
+ *
+ * ID 格式为 `{type-prefix}_{number}`，取所有节点中最大的数字后缀作为 counter 起点。
+ */
+export function syncNodeCounter(nodeIds: string[]): void {
+  let maxCounter = 0;
+  for (const id of nodeIds) {
+    const match = id.match(/^[a-z]+_(\d+)$/);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (num > maxCounter) maxCounter = num;
+    }
+  }
+  nodeCounter = Math.max(nodeCounter, maxCounter);
+}
+
+/**
+ * 从已有边 ID 列表中同步 edgeCounter，防止新边 ID 冲突。
+ * 加载已有工作流 YAML 后必须调用。
+ */
+export function syncEdgeCounter(edgeIds: string[]): void {
+  let maxCounter = 0;
+  for (const id of edgeIds) {
+    const match = id.match(/^e(\d+)_/);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (num > maxCounter) maxCounter = num;
+    }
+  }
+  edgeCounter = Math.max(edgeCounter, maxCounter);
 }
 
 /** 参数指引边数据 */
@@ -230,11 +285,19 @@ export function parseDataFlowEdges(nodes: Array<{ id: string; data: Record<strin
     if (!inputs || typeof inputs !== "object") continue;
     for (const [paramName, expr] of Object.entries(inputs as Record<string, string>)) {
       if (typeof expr !== "string") continue;
-      const match = expr.match(/^nodes\.([a-zA-Z0-9_-]+)\.(.+)$/);
+      // 兼容两种写法：YAML 导入的 ${{ nodes.X.output.Y }} 和 UI 创建的 nodes.X.output.Y
+      const inner = expr.startsWith("${{") && expr.endsWith("}}") ? expr.slice(3, -2).trim() : expr;
+      const match = inner.match(/^nodes\.([a-zA-Z0-9_-]+)\.(.+)$/);
       if (!match) continue;
+      let sourceField = match[2];
+      // 去掉 output. 命名空间前缀：${{ nodes.X.output.Y }} 中 output 是固定命名空间，
+      // 源节点上实际的 Handle ID 是 out-Y 而不是 out-output.Y
+      if (sourceField.startsWith("output.")) {
+        sourceField = sourceField.slice(7);
+      }
       result.push({
         sourceNodeId: match[1],
-        sourceField: match[2],
+        sourceField,
         targetNodeId: node.id,
         targetParam: paramName,
       });

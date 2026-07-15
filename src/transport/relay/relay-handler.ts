@@ -1,11 +1,18 @@
 import { log, error as logError } from "@fenix/logger";
 import type { EngineRelayHandle } from "@fenix/plugin-sdk";
+import { AppError } from "../../errors";
 import type { EnvironmentRecord } from "../../repositories/environment";
 import { environmentRepo } from "../../repositories/environment";
+import {
+  markInstanceRelayAttached,
+  markInstanceRelayDetached,
+  touchInstanceActivity,
+} from "../../services/acp-idle-monitor";
 import { getAgentConfigById } from "../../services/config/agent-config";
+import { getCoreRuntime } from "../../services/core-bootstrap";
 import { resolveWorkspacePath } from "../../services/workspace-resolver";
 import type { RelayConnectionEntry } from "../../types/store";
-import { findMachineConnectionById, sendToWs, setAgentMachineCache } from "../acp-ws-handler";
+import { findMachineConnectionById, getAgentMachineCache, sendToWs, setAgentMachineCache } from "../acp-ws-handler";
 import type { WsConnection } from "../ws-types";
 import { RelayConnectionManager, sendToRelayWs } from "./connection-manager";
 import { filterConnectFromFlush } from "./message-router";
@@ -15,6 +22,19 @@ type FullRelayHandle = EngineRelayHandle & {
   onMessage?: (listener: (message: { type: string; payload?: unknown }) => void) => () => void;
   ready?: Promise<void>;
 };
+
+/**
+ * 通过 CoreRuntimeFacade 连接 Agent relay handle。
+ * 共享于 WS relay 和 HTTP OpenAI 端点。
+ */
+export async function connectAgentRelay(instanceId: string, sessionId: string): Promise<EngineRelayHandle> {
+  const { getCoreRuntime } = await import("../../services/core-bootstrap");
+  const facade = getCoreRuntime();
+  const handle = await facade.connectInstanceRelay({ instanceId, sessionId });
+  const full = handle as FullRelayHandle;
+  if (full.ready) await full.ready;
+  return handle;
+}
 
 const manager = new RelayConnectionManager();
 
@@ -89,6 +109,14 @@ async function openLocalRelay(
   } catch (err) {
     pendingRelayMessages.delete(relayWsId);
     const msg = err instanceof Error ? err.message : String(err);
+    // 远程节点不可用：使用 4500 关闭码，前端不自动重连，等用户手动点击重连
+    // 其他 spawn 失败保持 1011，前端可自动重连（可能是临时故障）
+    if (err instanceof AppError && err.code === "MACHINE_OFFLINE") {
+      log(`Relay rejected: machine offline agentId=${agentId}`);
+      sendToRelayWs(ws, { type: "error", payload: { code: "machine_unavailable", message: msg } });
+      ws.close(4500, "machine offline");
+      return;
+    }
     sendToRelayWs(ws, { type: "error", payload: { message: `Failed to start local instance: ${msg}` } });
     ws.close(1011, "spawn failed");
     return;
@@ -103,12 +131,7 @@ async function openLocalRelay(
   // 2. 通过 CoreRuntimeFacade 连接 relay handle（先不加入 manager，避免空窗期路由错误）
   let handle: EngineRelayHandle;
   try {
-    const { getCoreRuntime } = await import("../../services/core-bootstrap");
-    const facade = getCoreRuntime();
-    handle = await facade.connectInstanceRelay({ instanceId, sessionId });
-
-    const full = handle as FullRelayHandle;
-    if (full.ready) await full.ready;
+    handle = await connectAgentRelay(instanceId, sessionId);
 
     // WS 在 await 期间关闭 → 清理 handle 并放弃
     if (ws.readyState !== 1) {
@@ -155,6 +178,9 @@ async function openLocalRelay(
     workspacePath: resolveWorkspacePath(_env.organizationId ?? userId, userId, _env.id),
   };
   manager.add(relayWsId, entry);
+  if (instanceId) {
+    markInstanceRelayAttached(instanceId);
+  }
 
   // 4. 先发送 relay 层的 status（携带 agent_prompt），再注册 onMessage
   //    确保前端先收到连接就绪信号，再收到 agent 的 capabilities
@@ -165,13 +191,14 @@ async function openLocalRelay(
   const full = handle as FullRelayHandle;
   if (full.onMessage) {
     entry.relayUnsub = full.onMessage((message) => {
+      const msgType = (message as unknown as Record<string, unknown>).type as string | undefined;
       // 转发 agent 的 status（含 capabilities），使前端能检测 session/list 等能力
-      if ((message as Record<string, unknown>).type === "status") {
+      if (msgType === "status") {
         log("Relay ← agent status", { relayWsId, agentId, instanceId, payload: JSON.stringify(message).slice(0, 300) });
         sendToRelayWs(ws, message);
         return;
       }
-      if ((message as Record<string, unknown>).type === "relay_closed") {
+      if (msgType === "relay_closed") {
         log("Relay ← agent relay_closed", { relayWsId, agentId, instanceId });
         sendToRelayWs(ws, {
           type: "error",
@@ -180,8 +207,24 @@ async function openLocalRelay(
         ws.close(1011, "relay handle closed");
         return;
       }
+      if (entry.instanceId && typeof msgType === "string" && msgType !== "status") {
+        touchInstanceActivity(entry.instanceId, message as unknown as Record<string, unknown>);
+      }
       const e = manager.get(relayWsId);
-      if (e?.ws.readyState !== 1) return;
+      if (!e) {
+        logError("Relay ← agent: entry not found in manager", { relayWsId, agentId, instanceId, msgType });
+        return;
+      }
+      if (e.ws.readyState !== 1) {
+        logError("Relay ← agent: frontend WS not open", {
+          relayWsId,
+          agentId,
+          instanceId,
+          msgType,
+          readyState: e.ws.readyState,
+        });
+        return;
+      }
       sendToRelayWs(e.ws, message);
     });
   }
@@ -289,6 +332,9 @@ export async function handleRelayMessage(
       }
     }
     try {
+      if (entry.instanceId) {
+        touchInstanceActivity(entry.instanceId, parsed);
+      }
       log("Relay → agent", {
         relayWsId,
         agentId: entry.agentId,
@@ -314,6 +360,10 @@ export function handleRelayClose(_ws: WsConnection, relayWsId: string, code?: nu
   const entry = manager.get(relayWsId);
   if (!entry) return;
 
+  if (entry.instanceId) {
+    markInstanceRelayDetached(entry.instanceId);
+  }
+
   const duration = Math.round((Date.now() - entry.openTime) / 1000);
   log(
     `Connection closed: relayWsId=${relayWsId} agentId=${entry.agentId} code=${code ?? "none"} duration=${duration}s`,
@@ -323,6 +373,16 @@ export function handleRelayClose(_ws: WsConnection, relayWsId: string, code?: nu
   // 前端刷新时 relay 断连不应终止远程实例，前端重连后应能复用
   if (entry.relayHandle) {
     entry.relayUnsub?.();
+  }
+
+  // 当前端 relay 全部断开时，通知 agent 侧立即取消所有待决权限请求，
+  // 避免 agent 中 requestPermission 的 pending Promise 等待 30s 超时才返回 cancelled。
+  if (entry.instanceId && entry.relayHandle && !manager.hasOtherRelayForInstance(entry.instanceId, relayWsId)) {
+    try {
+      entry.relayHandle.send({ type: "cancel_pending_permissions" });
+    } catch (err) {
+      logError("handleRelayClose: failed to send cancel_pending_permissions", err);
+    }
   }
 
   manager.remove(relayWsId);
@@ -412,25 +472,50 @@ export function handleMachineReconnect(machineId: string): void {
 }
 
 function closeRelayByMachine(machineId: string, reason: string): void {
+  // 查找运行在目标 machine 上的所有实例 ID，用于匹配 relay 连接
+  // 注意：调用方可能已经通过 unregisterRemoteNode 删除了 core 中的实例，
+  // 所以需要同时用 agentMachineCache（agentId → machineId）做兜底匹配
+  const facade = getCoreRuntime();
+  const instanceIdsOnMachine = new Set<string>();
+  if (facade) {
+    for (const inst of facade.listInstances()) {
+      if (inst.nodeId === machineId) instanceIdsOnMachine.add(inst.instanceId);
+    }
+  }
+  // 兜底：通过 agentMachineCache 匹配（unregisterRemoteNode 不清此缓存）
+  const machineCache = getAgentMachineCache();
+
+  log(
+    `[ACP-Relay] closeRelayByMachine: machineId=${machineId} reason=${reason} instancesOnMachine=[${[...instanceIdsOnMachine].join(",")}] relayEntries=${manager.size}`,
+  );
+
   for (const [relayWsId, entry] of manager.entries()) {
-    // 匹配条件：instanceId 等于 machineId（远程实例的 instanceId 即为 machineId）
-    if (entry.instanceId !== machineId) continue;
-    log(`[ACP-Relay] Closing relay ${relayWsId} (${reason})`);
+    // 匹配条件：instanceId 在 core 实例列表中，或 agentId 的 machineId 缓存匹配
+    const matchByInstance = instanceIdsOnMachine.has(entry.instanceId ?? "");
+    const matchByCache = machineCache.get(entry.agentId) === machineId;
+    if (!matchByInstance && !matchByCache) continue;
+    log(
+      `[ACP-Relay] Closing relay ${relayWsId} (${reason}) instanceId=${entry.instanceId} agentId=${entry.agentId} match=${matchByInstance ? "instance" : "cache"}`,
+    );
     try {
-      entry.relayHandle?.close(1011, reason);
+      entry.relayHandle?.close(4500, reason);
     } catch {
       /* ignore */
     }
     entry.relayUnsub?.();
+    // 4500 = 远程节点不可用，前端不自动重连，等用户手动点击
     if (entry.ws.readyState === 1) {
-      sendToRelayWs(entry.ws, { type: "error", payload: { message: reason } });
+      sendToRelayWs(entry.ws, { type: "error", payload: { code: "machine_unavailable", message: reason } });
       try {
-        entry.ws.close(1011, reason);
+        entry.ws.close(4500, reason);
       } catch {
         /* ignore */
       }
     }
     clearInterval(entry.keepalive!);
+    if (entry.instanceId) {
+      markInstanceRelayDetached(entry.instanceId);
+    }
     manager.remove(relayWsId);
   }
 }

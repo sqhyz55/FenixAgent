@@ -13,7 +13,9 @@ src/utils/vendor/
 # AI tool runtime directories
 .agents/*
 !.agents/skills/
-.claude/
+.claude/*
+!/.claude/skills/
+!/.claude/skills/fenix-code-review/
 .codegraph/
 .omx/
 .docs/task/
@@ -47,6 +49,8 @@ data
 !.codex/prompts/**
 
 user
+!docs/user/
+!docs/user/**
 !bun.lock
 *.tar
 *.tar.gz
@@ -67,7 +71,12 @@ docs/.vitepress/.temp/
 .tanstack
 docker/acp-link/acp-link-*
 packages/sdk/sdk
+packages/plugin-claude-code/plugin-claude-code
+.workspace-registry.json
 .worktrees/
 packages/plugin-ccb/node_modules/
+superpowers/
 
 tmp
+.bunenv/
+.zcode/

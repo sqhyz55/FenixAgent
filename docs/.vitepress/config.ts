@@ -1,8 +1,9 @@
 import { defineConfig } from "vitepress";
 
 export default defineConfig({
-  title: "Remote Control Server",
-  description: "AI Agent 控制面板 — 基于 Hono + Bun 的远程 Agent 管理平台",
+  base: "/FenixAgent/",
+  title: "FenixAgent",
+  description: "Fenix Agent — AI Agent 智能控制平台",
   lang: "zh-CN",
   markdown: {
     theme: {
@@ -11,19 +12,22 @@ export default defineConfig({
     },
   },
   head: [
-    ["link", { rel: "icon", type: "image/svg+xml", href: "/logo.svg" }],
-    ["meta", { name: "theme-color", content: "#e8853b" }],
+    ["link", { rel: "icon", type: "image/png", href: "/FenixAgent/fenix-agent-logo-mark.png" }],
+    ["link", { rel: "apple-touch-icon", href: "/FenixAgent/fenix-agent-logo-mark.png" }],
+    ["meta", { name: "theme-color", content: "#1677ff" }],
     ["meta", { name: "og:type", content: "website" }],
     ["meta", { name: "og:locale", content: "zh_CN" }],
   ],
   cleanUrls: true,
   lastUpdated: true,
+  ignoreDeadLinks: true,
   themeConfig: {
-    logo: "/logo.svg",
-    siteTitle: "RCS",
+    logo: "/fenix-agent-logo-mark.png",
+    siteTitle: "FenixAgent",
     nav: [
       { text: "用户文档", link: "/user/" },
       { text: "开发者文档", link: "/developer/" },
+      { text: "架构文档", link: "/arch/" },
     ],
     sidebar: {
       "/user/": [
@@ -61,11 +65,73 @@ export default defineConfig({
         {
           text: "使用指南",
           items: [
+            { text: "后端开发规范", link: "/developer/guide/backend-development" },
+            { text: "External API", link: "/developer/guide/external-api" },
+            { text: "Agent 管理与会话说明", link: "/developer/guide/external-agent-session-guide" },
             { text: "系统提示词", link: "/developer/guide/system-prompt" },
             { text: "Skill 开发", link: "/developer/guide/skill-development" },
             { text: "多智能体协作", link: "/developer/guide/multi-agent" },
             { text: "MCP 工具集成", link: "/developer/guide/mcp-integration" },
             { text: "知识库", link: "/developer/guide/knowledge-base" },
+          ],
+        },
+        {
+          text: "架构参考",
+          items: [
+            { text: "Agent 引擎架构", link: "/developer/arch/agent-engine-architecture" },
+            { text: "Agent Sites 架构", link: "/developer/arch/agent-sites-architecture" },
+            { text: "Workflow 架构", link: "/developer/arch/workflow-architecture" },
+            { text: "Remote Machine Registry", link: "/developer/arch/remote-machine-registry" },
+          ],
+        },
+      ],
+      "/arch/": [
+        {
+          text: "全局概览",
+          items: [
+            { text: "总体架构", link: "/arch/tech-stack-overview" },
+            { text: "后端技术栈", link: "/arch/tech-stack-backend" },
+            { text: "前端技术栈", link: "/arch/tech-stack-frontend" },
+          ],
+        },
+        {
+          text: "权限与认证",
+          items: [
+            { text: "认证系统", link: "/arch/03-auth" },
+            { text: "用户与组织", link: "/arch/14-user-org" },
+          ],
+        },
+        {
+          text: "Agent 系统",
+          items: [
+            { text: "Agent Config", link: "/arch/04-agent-config" },
+            { text: "Agent 实例", link: "/arch/08-instance" },
+            { text: "Agent 接口", link: "/arch/05-chat" },
+            { text: "文件系统", link: "/arch/12-files" },
+          ],
+        },
+        {
+          text: "配置系统",
+          items: [
+            { text: "概览", link: "/arch/06-config" },
+            { text: "模型配置", link: "/arch/06-config-provider" },
+            { text: "Skills 配置", link: "/arch/06-config-skills" },
+            { text: "MCP 配置", link: "/arch/06-config-mcp" },
+            { text: "记忆配置", link: "/arch/06-config-hindsight" },
+          ],
+        },
+        {
+          text: "业务模块",
+          items: [
+            { text: "工作流引擎", link: "/arch/17-workflow" },
+            { text: "知识库", link: "/arch/11-knowledge" },
+            { text: "Agent Sites", link: "/arch/18-agent-sites" },
+          ],
+        },
+        {
+          text: "附录",
+          items: [
+            { text: "改动清单", link: "/arch/changes" },
           ],
         },
       ],

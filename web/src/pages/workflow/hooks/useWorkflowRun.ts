@@ -2,6 +2,7 @@ import type { Edge, Node } from "@xyflow/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import { unwrap } from "../../../api/request";
 import { workflowDefApi } from "../../../api/workflow-defs";
 import {
   type DAGEvent,
@@ -127,24 +128,27 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
     setRunning(true);
     setDryRunResult(null);
     try {
-      const result = await workflowEngineApi.dryRun(y);
+      const result = await unwrap(workflowEngineApi.dryRun(y));
       setDryRunResult(result);
     } catch (err) {
       console.error(err);
-      pushWorkflowError("validation", (err as Error).message);
+      pushWorkflowError(workflowId, "validation", (err as Error).message);
       setDryRunResult({ valid: false, issues: [{ type: "error", message: (err as Error).message }] });
     } finally {
       setRunning(false);
     }
-  }, [syncYaml]);
+  }, [syncYaml, workflowId]);
 
   const updateNodesFromSnapshot = useCallback(
     (snap: DAGSnapshot) => {
+      const dagRunning = snap.dag_status === "RUNNING";
       setNodes((nds) =>
         nds.map((n) => {
           if (n.id === START_NODE_ID) return n;
-          const state = snap.node_states[n.id];
-          if (!state)
+          const state = snap.node_states?.[n.id];
+          if (!state) {
+            // DAG 运行中但快照尚无此节点状态时（引擎尚未开始调度），保留现有的 RUNNING 乐观状态
+            if (dagRunning && n.data._runStatus === "RUNNING") return n;
             return {
               ...n,
               data: {
@@ -155,6 +159,13 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
                 _onRerunFrom: undefined,
               },
             };
+          }
+          // DAG 正在运行且前端已乐观设为 RUNNING 时，若 snapshot 返回 PENDING，
+          // 保持 RUNNING 避免覆盖（snapshot 可能在引擎调度该节点之前创建）
+          const prevStatus = n.data._runStatus as string | undefined;
+          if (dagRunning && state.status === "PENDING" && prevStatus === "RUNNING") {
+            return n;
+          }
           return {
             ...n,
             data: {
@@ -178,20 +189,20 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
     async (runId: string) => {
       try {
         const [snap, evts] = await Promise.all([
-          workflowEngineApi.getRunStatus(runId),
-          workflowEngineApi.getEvents(runId),
+          unwrap(workflowEngineApi.getRunStatus(runId)),
+          unwrap(workflowEngineApi.getEvents(runId)),
         ]);
         if (snap) {
           setRunSnapshot(snap);
           updateNodesFromSnapshotRef.current(snap);
-          pushWorkflowRunStatus(buildRunSummary(snap));
+          pushWorkflowRunStatus(workflowId, buildRunSummary(snap));
         }
         if (Array.isArray(evts)) setRunEvents(dedupEvents(evts));
       } catch (err) {
         console.error(err);
       }
     },
-    [setRunSnapshot, setRunEvents],
+    [setRunSnapshot, setRunEvents, workflowId],
   );
 
   useEffect(() => {
@@ -222,8 +233,7 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
       setRunApprovals([]);
       return;
     }
-    workflowEngineApi
-      .getPendingApprovals(activeRunId)
+    unwrap(workflowEngineApi.getPendingApprovals(activeRunId))
       .then((list) => setRunApprovals(Array.isArray(list) ? list : []))
       .catch((err) => console.error(err));
   }, [activeRunId, runSnapshot, setRunApprovals]);
@@ -233,8 +243,7 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
     setNodeOutputLoading(true);
     setSelectedNodeOutput(null);
     setRunRightTab("output");
-    workflowEngineApi
-      .getOutput(activeRunId, selectedRunNodeId)
+    unwrap(workflowEngineApi.getOutput(activeRunId, selectedRunNodeId))
       .then((out) => setSelectedNodeOutput(out ?? null))
       .catch((err) => console.error(err))
       .finally(() => setNodeOutputLoading(false));
@@ -260,11 +269,11 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
       const y = syncYaml();
       setRunning(true);
       setDryRunResult(null);
-      clearWorkflowEvents();
+      clearWorkflowEvents(workflowId);
 
       if (workflowId) {
         try {
-          await workflowDefApi.save(workflowId, y);
+          await unwrap(workflowDefApi.save(workflowId, y));
         } catch (err) {
           console.error(`${t("editor.auto_save_failed")}:`, err);
           toast.error(`${t("editor.auto_save_failed")}: ${(err as Error).message}`);
@@ -282,7 +291,7 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
 
       try {
         const runParams = params ?? resolveDefaultParams();
-        const result = await workflowEngineApi.run(y, runParams, workflowId);
+        const result = await unwrap(workflowEngineApi.run(y, runParams, workflowId));
         setActiveRunId(result.runId);
         setRunSnapshot(null);
         setRunEvents([]);
@@ -294,7 +303,7 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
         // running 保持 true，轮询检测到终止状态时重置
       } catch (err) {
         console.error(err);
-        pushWorkflowError("run", (err as Error).message);
+        pushWorkflowError(workflowId, "run", (err as Error).message);
         toast.error(`${t("editor.run_failed")}: ${(err as Error).message}`);
         setRunning(false);
       } finally {
@@ -321,7 +330,7 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
   const handleCancelRun = useCallback(async () => {
     if (!activeRunId) return;
     try {
-      await workflowEngineApi.cancel(activeRunId);
+      await unwrap(workflowEngineApi.cancel(activeRunId));
       await loadRunData(activeRunId);
     } catch (err) {
       console.error(err);
@@ -333,9 +342,9 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
     async (approval: PendingApproval) => {
       if (!activeRunId) return;
       try {
-        await workflowEngineApi.approve(activeRunId, approval.nodeId, approval.approvalToken);
+        await unwrap(workflowEngineApi.approve(activeRunId, approval.nodeId, approval.approvalToken));
         await loadRunData(activeRunId);
-        const list = await workflowEngineApi.getPendingApprovals(activeRunId);
+        const list = await unwrap(workflowEngineApi.getPendingApprovals(activeRunId));
         setRunApprovals(Array.isArray(list) ? list : []);
       } catch (err) {
         console.error(err);
@@ -420,7 +429,7 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
       const y = syncYaml();
       if (workflowId) {
         try {
-          await workflowDefApi.save(workflowId, y);
+          await unwrap(workflowDefApi.save(workflowId, y));
         } catch (err) {
           console.error(`${t("editor.auto_save_failed")}:`, err);
           toast.error(`${t("editor.auto_save_failed")}: ${(err as Error).message}`);
@@ -457,7 +466,7 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
       });
 
       try {
-        const result = await workflowEngineApi.rerunFrom(activeRunId, y, fromNodeId, workflowId);
+        const result = await unwrap(workflowEngineApi.rerunFrom(activeRunId, y, fromNodeId, workflowId));
         setActiveRunId(result.runId);
         setRunSnapshot(null);
         setRunEvents([]);
@@ -501,7 +510,7 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
       setSelectedNodeOutput(null);
       openRunSheet();
       try {
-        const out = await workflowEngineApi.getOutput(activeRunId, nodeId);
+        const out = await unwrap(workflowEngineApi.getOutput(activeRunId, nodeId));
         setSelectedNodeOutput(out ?? null);
       } catch (err) {
         console.error(err);
@@ -520,18 +529,20 @@ export function useWorkflowRun(params: UseWorkflowRunParams): UseWorkflowRunRetu
   const handleRefreshDraft = useCallback(async () => {
     if (!workflowId) return;
     if (isRunMode && !isRunDone) return;
-    const { yamlToFlow } = await import("../yaml-utils");
+    const { syncEdgeCounter, syncNodeCounter, yamlToFlow } = await import("../yaml-utils");
     try {
-      const wf = await workflowDefApi.get(workflowId);
+      const wf = await unwrap(workflowDefApi.get(workflowId));
       if (wf.draftYaml) {
         const { nodes: newNodes, edges: newEdges, meta: newMeta } = yamlToFlow(wf.draftYaml);
+        syncNodeCounter(newNodes.map((n) => n.id));
+        syncEdgeCounter(newEdges.map((e) => e.id));
         setNodes(autoLayout(newNodes, newEdges));
         setEdges(newEdges);
         setMeta(() => newMeta);
         setLastSavedYaml(wf.draftYaml);
         if (activeRunId) {
           try {
-            const snap = await workflowEngineApi.getRunStatus(activeRunId);
+            const snap = await unwrap(workflowEngineApi.getRunStatus(activeRunId));
             if (snap) updateNodesFromSnapshotRef.current(snap);
           } catch (err) {
             console.error(`${t("editor.restore_run_failed")}:`, err);

@@ -10,6 +10,8 @@ async function proxyToAcpxG(targetPath: string, request: Request): Promise<Respo
   const init: RequestInit = {
     method: request.method,
     headers,
+    // 透传客户端 abort 信号：客户端断连时上游请求也取消，避免占用下游资源
+    signal: request.signal,
   };
   if (request.method !== "GET" && request.method !== "HEAD") {
     init.body = request.body;
@@ -22,6 +24,10 @@ async function proxyToAcpxG(targetPath: string, request: Request): Promise<Respo
       headers: res.headers,
     });
   } catch (err: unknown) {
+    // 客户端主动断连属于预期行为，不当作 502 上报
+    if (err instanceof Error && err.name === "AbortError") {
+      return new Response(null, { status: 499, statusText: "Client Closed Request" });
+    }
     return new Response(
       JSON.stringify({
         error: {
@@ -37,10 +43,23 @@ async function proxyToAcpxG(targetPath: string, request: Request): Promise<Respo
 // 静态资源代理：挂载到 /workflow-ui，转发到 acpx-g 根路径
 export const workflowStaticApp = new Elysia({ name: "workflow-static", prefix: "/workflow-ui" })
   .use(authGuardPlugin)
-  .all("/", ({ request }) => proxyToAcpxG("/", request), { sessionAuth: true })
-  .all("/:path", ({ params, request }) => proxyToAcpxG(`/${params.path}`, request), { sessionAuth: true });
-
-// API 代理：挂载到 /api/v1，转发到 acpx-g 的 /api/v1/* 路径
-export const workflowApiApp = new Elysia({ name: "workflow-api", prefix: "/api/v1" })
-  .use(authGuardPlugin)
-  .all("/:path", ({ params, request }) => proxyToAcpxG(`/api/v1/${params.path}`, request), { sessionAuth: true });
+  .all("/", ({ request }) => proxyToAcpxG("/", request), {
+    sessionAuth: true,
+    detail: {
+      hide: true,
+      tags: ["Workflow Engine"],
+      summary: "访问 Workflow UI 代理入口",
+      description:
+        "将 `/workflow-ui/` 请求透传到内部 `acpx-g` 服务根路径，用于加载工作流前端界面入口。该接口是静态资源代理，具体响应内容取决于下游服务。",
+    },
+  })
+  .all("/:path", ({ params, request }) => proxyToAcpxG(`/${params.path}`, request), {
+    sessionAuth: true,
+    detail: {
+      hide: true,
+      tags: ["Workflow Engine"],
+      summary: "访问 Workflow UI 代理资源",
+      description:
+        "将 `/workflow-ui/:path` 请求透传到内部 `acpx-g` 服务对应路径，用于加载工作流页面依赖的脚本、样式和其他静态资源。该接口是透传代理，不在当前文档中展开下游资源结构。",
+    },
+  });

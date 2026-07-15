@@ -6,38 +6,46 @@ interceptConsole();
 const startupLog = createLogger("rcs");
 
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import swagger from "@elysiajs/swagger";
 import Elysia from "elysia";
 import { applyEnv, config } from "./config";
 import { db, initDb, client as pgClient } from "./db";
 import { agentSession } from "./db/schema";
 import { validateEnv } from "./env";
+import { createExternalOpenApiPlugin, createWebOpenApiPlugin } from "./openapi";
 import { authPlugin } from "./plugins/auth";
 import { corsPlugin } from "./plugins/cors";
 import { errorPlugin } from "./plugins/error-handler";
-import { loggerPlugin } from "./plugins/logger";
+import { deriveRequestId, injectRequestId, logError, logRequest, logResponse } from "./plugins/logger";
 import { rateLimitPlugin } from "./plugins/rate-limit";
 import { ctrlStaticPlugin } from "./plugins/static";
-import { environmentRepo } from "./repositories";
 import acpRoutes from "./routes/acp";
+import { agentSitesCompatApp, agentSitesProxyApp } from "./routes/agent-sites-proxy";
+import apiAgentsRoutes from "./routes/api/agents";
+import apiInstanceRoutes from "./routes/api/instances";
+import apiKnowledgeBaseRoutes from "./routes/api/knowledge-bases";
+import apiMcpRoutes from "./routes/api/mcp";
+import apiModelsRoutes from "./routes/api/models";
+import openaiChatRoutes from "./routes/api/openai-chat";
+import apiSkillsRoutes from "./routes/api/skills";
+import apiSystemRoutes from "./routes/api/system";
+import apiWorkflowRoutes from "./routes/api/workflows";
+import apiWorkspaceRoutes from "./routes/api/workspaces";
 import knowledgeMcpRoutes from "./routes/mcp/knowledge";
-import v2CodeSessions from "./routes/v2/code-sessions";
-import sessionIngress from "./routes/v2/session-ingress";
-import v2Worker from "./routes/v2/worker";
-import v2WorkerEvents from "./routes/v2/worker-events";
-import v2WorkerEventsStream from "./routes/v2/worker-events-stream";
+import skillDownloadRoutes from "./routes/skills";
 import webApp from "./routes/web";
 import { workflowStaticApp } from "./routes/web/workflow-proxy";
+import { startAcpIdleMonitor, stopAcpIdleMonitor } from "./services/acp-idle-monitor";
 import { closeCache } from "./services/cache";
-import { getCoreRuntime } from "./services/core-bootstrap";
+import { initCoreRuntime } from "./services/core-bootstrap";
 import { runDataMigrations } from "./services/data-migrate";
 import { getHermesClient, initHermesClient } from "./services/hermes-client";
-import { findRunningInstanceByEnvironment, spawnInstanceFromEnvironment, stopAllInstances } from "./services/instance";
-import { startScheduler, stopScheduler } from "./services/scheduler";
+import { stopAllInstances } from "./services/instance";
+import { checkRagFlowHealth } from "./services/knowledge-provider/ragflow";
+import { schedulerService } from "./services/scheduler/index";
 import { syncBuiltin } from "./services/sync-builtin";
 import { ensureSystemAdmin } from "./services/system-admin";
-import { resolveWorkspacePath } from "./services/workspace-resolver";
+import { startScheduler, stopScheduler } from "./services/task";
+import { initCustomToolsRegistry } from "./services/workflow/custom-tools";
 import { closeAllAcpConnections } from "./transport/acp-ws-handler";
 import { closeAllFileWsConnections } from "./transport/file-ws-handler";
 import { closeAllRelayConnections } from "./transport/relay";
@@ -62,10 +70,10 @@ import { sql } from "drizzle-orm";
 
 await db.update(agentSession).set({ status: "idle", updatedAt: new Date() }).where(sql`1=1`);
 
-getCoreRuntime();
+await initCoreRuntime();
 startupLog.info("Core runtime initialized");
 
-await startScheduler();
+await Promise.all([startScheduler(), schedulerService.start()]);
 
 try {
   // builtin 资源现在统一托管到系统 admin 组织，不再在启动时遍历所有组织复制副本。
@@ -75,6 +83,12 @@ try {
   startupLog.error("Failed to sync builtin resources", err instanceof Error ? err : undefined);
 }
 
+// 初始化自定义节点工具注册表：扫描 WORKFLOW_TOOLS_DIR，注册 SlurmNode 子类。
+// 必须在 getTeamEngine() 调用前完成，否则 yaml 中 type: custom 的节点会因 tool 未注册而失败。
+// discover 内部已捕获异常并 fallback 到空 registry，不会阻塞服务启动。
+await initCustomToolsRegistry();
+startupLog.info("Custom tools registry initialized");
+
 // Initialize Hermes client if configured
 // biome-ignore lint/suspicious/noExplicitAny: config channels shape is dynamic
 const hermesUrl = process.env.HERMES_URL ?? (config as any).channels?.hermesUrl;
@@ -82,105 +96,47 @@ if (hermesUrl) {
   initHermesClient(hermesUrl);
 }
 
+// Verify RagFlow connectivity (non-blocking — logs warning on failure)
+const ragflowHealth = await checkRagFlowHealth();
+if (ragflowHealth.ok) {
+  console.log(`[startup] ${ragflowHealth.message}`);
+} else {
+  console.warn(`[startup] RagFlow health check failed: ${ragflowHealth.message}`);
+}
+
 // Kill stale acp-link processes from previous runs
 try {
-  execSync("pkill -f 'acp-link.*opencode' || true", { stdio: "ignore" });
+  execSync("pkill -f 'acp-link' || true", { stdio: "ignore" });
 } catch {
   // pkill not available or no matching processes — ignore
 }
-
-// Auto-start instances for all environments on server boot
-(async () => {
-  const envs = await environmentRepo.listAll();
-  for (const env of envs) {
-    if (!env.userId) continue;
-    if (!env.organizationId) continue;
-    if (!env.autoStart) continue;
-    // 只为没有 machineId 的 environment 本地 spawn（有 machineId 的由远端 machine 管理）
-    if (env.agentConfigId) {
-      const { getAgentConfigById } = await import("./services/config/agent-config");
-      const agentCfg = await getAgentConfigById(env.agentConfigId);
-      if (agentCfg?.machineId) continue;
-    }
-    const cwd = resolveWorkspacePath(env.organizationId, env.userId, env.id);
-    if (!existsSync(cwd)) {
-      startupLog.warn(`Skipping ${env.name}: workspace directory does not exist`);
-      continue;
-    }
-    const existing = findRunningInstanceByEnvironment(env.id);
-    if (existing) continue;
-    try {
-      await spawnInstanceFromEnvironment(env.userId, env.id);
-      startupLog.info(`Auto-started: ${env.name}`);
-    } catch (err: unknown) {
-      startupLog.error(`Failed to auto-start ${env.name}`, err instanceof Error ? err : undefined);
-    }
-  }
-})();
 
 // 定期巡检：将无活跃 WS 连接的 machine 标为 offline（处理服务重启、网络分区等场景）
 import("./services/registry-heartbeat").then(({ startMachineSweep }) => {
   startMachineSweep(60_000);
 });
+startAcpIdleMonitor();
 
 const app = new Elysia()
   .use(corsPlugin)
-  .use(
-    swagger({
-      documentation: {
-        info: {
-          title: "RCS API",
-          version: config.version,
-          description: "Remote Control Server API — config, sessions, environments, ACP protocol",
-        },
-        tags: [
-          {
-            name: "Config",
-            description: "Configuration management (providers, models, agents, skills, MCP)",
-          },
-          {
-            name: "Sessions",
-            description: "Session management and event streaming",
-          },
-          {
-            name: "Environments",
-            description: "ACP agent environments",
-          },
-          {
-            name: "Instances",
-            description: "Agent instance lifecycle",
-          },
-          { name: "Tasks", description: "Scheduled HTTP tasks" },
-          {
-            name: "Knowledge",
-            description: "Knowledge bases and resources",
-          },
-          { name: "Channels", description: "IM channel bindings" },
-          {
-            name: "Workflow Engine",
-            description: "Native DAG workflow execution engine",
-          },
-        ],
-      },
-      swaggerOptions: {
-        persistAuthorization: true,
-      },
-      exclude: ["/health", /^\/ctrl\/.*/],
-      path: "/docs/swagger",
-    }),
-  )
-  .use(loggerPlugin)
+  .use(createExternalOpenApiPlugin(config.version))
+  .use(createWebOpenApiPlugin(config.version))
+  .derive(deriveRequestId)
+  .onBeforeHandle(logRequest)
+  .onAfterHandle(logResponse)
+  .onAfterHandle(injectRequestId)
+  .onError(({ request, error, set }) => logError({ request, error, set }))
   .use(errorPlugin)
   .use(rateLimitPlugin)
-  // 全局请求体大小限制 10MB
+  // 全局请求体大小限制 100MB（文件上传、工作流任务等场景）
   .onBeforeHandle(({ request }) => {
     const contentLength = request.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > 10 * 1024 * 1024) {
+    if (contentLength && parseInt(contentLength, 10) > 100 * 1024 * 1024) {
       return new Response(
         JSON.stringify({
           error: {
             type: "PAYLOAD_TOO_LARGE",
-            message: "Request body exceeds 10MB limit",
+            message: "Request body exceeds 100MB limit",
           },
         }),
         {
@@ -203,28 +159,50 @@ const app = new Elysia()
   })
   // Health check
   .get("/health", () => ({ status: "ok", version: config.version }))
-  .get("/", ({ set }) => {
-    set.status = 302;
-    set.headers.Location = "/ctrl/";
-  })
+  .get(
+    "/",
+    ({ set }) => {
+      set.status = 302;
+      set.headers.Location = "/ctrl/";
+    },
+    {
+      detail: {
+        hide: true,
+        summary: "根路径跳转到控制台",
+        description: "服务根路径访问时统一重定向到 `/ctrl/` 控制台首页。该入口仅用于站点导航，默认不在公开文档中展示。",
+      },
+    },
+  )
   // better-auth handler
   .use(authPlugin)
   // Static files under /ctrl
   .use(ctrlStaticPlugin)
-  // v2 routes
-  .use(v2CodeSessions)
-  .use(sessionIngress)
-  .use(v2Worker)
-  .use(v2WorkerEvents)
-  .use(v2WorkerEventsStream)
   // Web control panel routes
   .use(webApp)
+  // Token-protected skill archive download for plugins/runtimes
+  .use(skillDownloadRoutes)
+  // Agent Sites L3 business frontend proxy (/web/site/deploy/:appId/* prefix)
+  .use(agentSitesProxyApp)
+  // External API routes
+  .use(apiAgentsRoutes)
+  .use(apiKnowledgeBaseRoutes)
+  .use(apiSkillsRoutes)
+  .use(apiModelsRoutes)
+  .use(apiMcpRoutes)
+  .use(apiSystemRoutes)
+  .use(apiInstanceRoutes)
+  .use(apiWorkspaceRoutes)
+  .use(apiWorkflowRoutes)
+  // OpenAI-compatible Chat API
+  .use(openaiChatRoutes)
   // Workflow proxy (not under /web prefix)
   .use(workflowStaticApp)
   // MCP routes
   .use(knowledgeMcpRoutes)
   // ACP protocol routes
-  .use(acpRoutes);
+  .use(acpRoutes)
+  // Agent Sites 兼容层（兜底 /app-xxx/* 绝对路径访问，必须注册在最后）
+  .use(agentSitesCompatApp);
 
 const port = config.port;
 const host = config.host;
@@ -243,11 +221,13 @@ async function gracefulShutdown(signal: string) {
   startupLog.info(`Received ${signal}, shutting down...`);
   const hermesClient = getHermesClient();
   await hermesClient?.stop();
+  stopAcpIdleMonitor();
   closeAllRelayConnections();
   closeAllAcpConnections();
   closeAllFileWsConnections();
   await stopAllInstances();
   stopScheduler();
+  schedulerService.stop();
   await closeCache();
   await pgClient.end();
   process.exit(0);

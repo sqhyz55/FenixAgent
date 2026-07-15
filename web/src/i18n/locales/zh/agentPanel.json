@@ -1,11 +1,13 @@
 {
   "brand": "Fenix",
   "showArtifacts": "显示内容面板",
+  "hideArtifacts": "隐藏内容面板",
   "collapseSidebar": "收起侧栏",
   "expandSidebar": "展开侧栏",
   "console": "控制台",
   "overview": "概览",
   "workflow": "智能体编排",
+  "agentManagement": "智能体管理",
   "models": "模型",
   "sessions": "会话",
   "config": "配置",
@@ -27,6 +29,10 @@
   "connectingAgent": "正在连接 Agent...",
   "agentDisconnected": "Agent 未连接",
   "agentOfflineDesc": "Agent 尚未上线，请确保 acp-link 已启动",
+  "machineUnavailable": "远程节点已断开",
+  "machineUnavailableDesc": "Agent 所在的远程机器不可用，请确认机器在线后点击重连",
+  "reconnect": "重连",
+  "reconnecting": "重连中...",
   "connecting": "正在连接...",
   "enterFailed": "进入失败",
   "loading_agent_panel": "加载智能体面板...",
@@ -66,5 +72,11 @@
   "metaAgentFailed": "启动 Meta Agent 失败",
   "cancel": "取消",
   "remoteNode": "远程",
-  "memories": "记忆"
+  "memories": "记忆",
+  "sites": "Agent Sites",
+  "changedFiles": {
+    "title": "变更文件",
+    "count_one": "{{count}} 个文件",
+    "count_other": "{{count}} 个文件"
+  }
 }
